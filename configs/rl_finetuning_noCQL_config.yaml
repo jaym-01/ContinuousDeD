@@ -1,0 +1,29 @@
+## TODO Document this... Make it look similar to https://github.com/microsoft/med-deadend/blob/main/config_sepsis.yaml
+
+## The following configuration parameters are for hyperparameter optimization of the D- and R- Networks
+## The objective of the optimization is to maximize the average AUC of the IQN-based models
+data_dir: "/ais/bulbasaur/twkillian/AHE_Sepsis_Data/rectilinear_processed/"
+output_dir: "/ais/bulbasaur/twkillian/UncDeD_Results/IQN/"
+output_fname: "best_iqn_model.pt"
+architecture: 'iqn'
+total_trials: 50
+seed: 2022
+train_batch_size: 64
+num_ps: 0
+num_ns: 2
+parameterization: [
+        {"name": "seed", "type": "fixed", "value": 0},
+        {"name": "num_actions", "type": "fixed", "value": 25},
+        {"name": "gamma", "type": "fixed", "value": 1.0},
+        {"name": "distortion_risk_measure", "type": "fixed", "value": "identity"},
+        {"name": "q_update_freq", "type": "fixed", "value": 5},
+        {"name": "use_cql", "type": "fixed", "value": False},
+        # {"name": "cql_weight", "type": "range", "bounds": [0.01, 0.5]}, 
+        {"name": "num_iqn_samples_train", "type": "choice", "values": [32, 64, 128]},
+        {"name": "num_iqn_samples_est", "type": "choice", "values": [32, 64, 128]},
+        # {"name": "tau", "type": "choice", "values": [0.005, 0.01, 0.05]},
+        {"name": "num_q_hidden_units", "type": "choice", "values": [16, 32, 64]},
+        {"name": "num_q_layers", "type": "choice", "values": [1, 2, 3]},
+        {"name": "lr", "type": "range", "bounds": [0.00001, 0.0005], "log_scale": True},
+        # {"name": "lr", "type": "fixed", "value": 0.0005},
+        {"name": "num_training_epochs", "type": "choice", "values": [50, 75]},]

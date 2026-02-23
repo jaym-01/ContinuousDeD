@@ -1,0 +1,21 @@
+#!/bin/bash
+
+#SBATCH --ntasks=1
+#SBATCH -t 180:00:00      # max runtime is 180 hours (9 days)
+#SBATCH -J jupyter_job    # name
+#SBATCH --mem=24GB
+#SBATCH -c 2              # Number of cpus
+#SBATCH -p ml4h
+#SBATCH -A ml4h
+#SBATCH --qos=ml4h
+#SBATCH -o jupyter_notebook_%J.log # TODO: Where to save your output
+
+date;hostname;pwd
+
+# source /ais/bulbasaur/twkillian/envs/uncded_env
+
+. jupyter.env
+
+export XDG_RUNTIME_DIR=""
+jupyter notebook --ip 0.0.0.0 --port 1234
+# python -m notebook --no-browser --port 2234
