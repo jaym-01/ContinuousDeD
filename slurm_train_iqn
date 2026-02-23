@@ -1,0 +1,25 @@
+#!/bin/bash
+
+#SBATCH --ntasks=1
+#SBATCH -t 180:00:00      # Max runtime is 180 hours (9 days)
+#SBATCH -J red_eval       # name
+#SBATCH --mem=64GB
+#SBATCH -c 4              # Number of cpus
+#SBATCH --gres=gpu:1      # Requesting a GPU
+#SBATCH -p ml4h
+#SBATCH -A ml4h
+#SBATCH --qos=ml4h
+#SBATCH -o OUTPUTS/red_eval_%J.log
+#SBATCH --array=1-8
+
+date;hostname;pwd
+
+source /ais/bulbasaur/twkillian/envs/uncded_env
+
+export XDG_RUNTIME_DIR=""
+
+# echo $(tail -n+$SLURM_ARRAY_TASK_ID iqn_cql_exps.txt | head -n1)
+echo $(tail -n+$SLURM_ARRAY_TASK_ID reduced_training_exps.txt | head -n1)
+
+# python -u train_rl.py $(tail -n+$SLURM_ARRAY_TASK_ID reduced_training_exps.txt | head -n1)
+python -u eval_ft.py $(tail -n+$SLURM_ARRAY_TASK_ID reduced_eval.txt | head -n1)

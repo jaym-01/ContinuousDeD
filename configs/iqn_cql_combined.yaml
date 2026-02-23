@@ -1,0 +1,26 @@
+seed: 2022
+num_actions: 25
+num_q_hidden_units: 64
+num_q_layers: 1
+gamma: 1.0
+lr: 0.00025
+tau: 0.005
+num_iqn_samples_train: 32
+num_iqn_samples_est: 32
+drm: "identity"
+dueling: False
+noisy_layer: False
+q_update_freq: 5
+data_dir: "/ais/bulbasaur/twkillian/AHE_Sepsis_Data/rectilinear_processed/"
+train_batch_size: 64
+val_batch_size: 128
+num_ps: 0
+num_ns: 2
+use_cql: True
+cql_weight: 0.5
+combined: True
+model: "IQN"
+num_epochs: 100
+saving_period: 1
+checkpoint_fname: "/ais/bulbasaur/twkillian/UncDeD_Results/IQN/iqn_cql_combined/"
+
