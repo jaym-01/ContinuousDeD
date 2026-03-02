@@ -1,0 +1,1 @@
+.venv/bin/python3 toy_domain/run.py -info "test" -frames 100 -ded -env LifeGate-v1

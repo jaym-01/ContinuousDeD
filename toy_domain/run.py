@@ -6,7 +6,7 @@ import os
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import time
-import gym
+import gymnasium as gym
 import argparse
 import wrapper
 import MultiPro
@@ -20,13 +20,13 @@ def evaluate(eps, frame, eval_runs=5):
 
     reward_batch = []
     for i in range(eval_runs):
-        state = eval_env.reset()
+        state, _ = eval_env.reset()
         rewards = 0
         while True:
             action = agent.act(np.expand_dims(state, axis=0), 0.001, eval=True)
-            state, reward, done, _ = eval_env.step(action[0].item())
+            state, reward, terminated, truncated, _ = eval_env.step(action[0].item())
             rewards += reward
-            if done:
+            if terminated or truncated:
                 break
         reward_batch.append(rewards)
         
@@ -93,6 +93,7 @@ def run(frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.01, eval_every=1
 
 
 if __name__ == "__main__":
+    # LifeGate-v1 is registered automatically via `import LifeGate` above
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-agent", type=str, choices=["iqn",
@@ -160,8 +161,8 @@ if __name__ == "__main__":
         # Initialize the LifeGate Tabular Environment (may use the vector based one?)
         envs = MultiPro.SubprocVecEnv([lambda: gym.make(args.env, state_mode=args.state_mode, rng=random_state, death_drag=args.drift, cont_states=args.cont_state) for i in range(args.worker)])
         eval_env = gym.make(args.env, state_mode=args.state_mode, rng=random_state, death_drag=args.drift, cont_states=args.cont_state)
-        action_size = len(eval_env.legal_actions)
-        state_size = (len(eval_env.tabular_state_shape),)  # Needs to be in tuple form for intializing the IQN model later
+        action_size = len(eval_env.unwrapped.legal_actions)
+        state_size = (len(eval_env.unwrapped.tabular_state_shape),)  # Needs to be in tuple form for intializing the IQN model later
     else:
         if "-ram" in args.env or args.env == "CartPole-v0" or args.env == "LunarLander-v2": 
             envs = MultiPro.SubprocVecEnv([lambda: gym.make(args.env) for i in range(args.worker)])
@@ -169,8 +170,7 @@ if __name__ == "__main__":
         else:
             envs = MultiPro.SubprocVecEnv([lambda: wrapper.make_env(args.env) for i in range(args.worker)])
             eval_env = wrapper.make_env(args.env)
-        envs.seed(seed)
-        eval_env.seed(seed+1)
+        # seed via env reset(seed=...) in gymnasium; legacy .seed() not supported
 
 
         action_size = eval_env.action_space.n
