@@ -1,7 +1,7 @@
 import collections
 import numpy as np
-import gym.spaces
-import gym
+import gymnasium.spaces
+import gymnasium as gym
 import cv2
 
 class FireResetEnv(gym.Wrapper):

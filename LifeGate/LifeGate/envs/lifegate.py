@@ -1,7 +1,7 @@
 import os
 from copy import deepcopy
 import pygame
-from gym import core, spaces
+from gymnasium import Env, spaces
 import numpy as np
 import click
 
@@ -17,7 +17,7 @@ YELLOW = (255, 255, 0)
 YL_RD = (255, 165, 0)
 
 
-class LifeGate(core.Env):
+class LifeGate(Env):
     def __init__(self, state_mode, rng, death_drag, cont_states=False, max_steps=100, fixed_life=True, rendering=False, image_saving=False, render_dir=None):
         self.rng = rng
         self.state_dtype = np.float32
@@ -48,6 +48,18 @@ class LifeGate(core.Env):
         self._rendering = rendering
         # self.state_shape = None
         self.init_subclass()
+        # Define gymnasium spaces
+        self.action_space = spaces.Discrete(self.nb_actions)
+        if self.state_mode == 'tabular':
+            self.observation_space = spaces.Box(
+                low=np.zeros(2, dtype=self.state_dtype),
+                high=np.array([self.scr_w - 1, self.scr_h - 1], dtype=self.state_dtype),
+                dtype=self.state_dtype)
+        elif self.state_mode == 'vector':
+            obs_size = self.scr_w + self.scr_h + len(self.possible_recoveries)
+            self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(obs_size,), dtype=self.state_dtype)
+        else:
+            raise ValueError(f'Unsupported state_mode for gymnasium spaces: {self.state_mode}')
         if rendering:
             self._init_pygame()
         self.image_saving = image_saving
@@ -105,7 +117,8 @@ class LifeGate(core.Env):
         self.render_dir = os.path.join(os.getcwd(), self.render_dir_main, 'render' + str(i))
         os.mkdir(self.render_dir)
     
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
         if self.image_saving:
             self._init_rendering_folder()
         self.game_over = False
@@ -113,7 +126,7 @@ class LifeGate(core.Env):
         self.recovery_observablity = True
         self.blue = BLUE
         state = self.init_episode()
-        return state
+        return state, {}
     
     def init_episode(self):
         # self.player_pos_x = np.random.randint(0, self.scr_w-1)  # Randomly set x-position anywhere but on the terminal edge
@@ -211,9 +224,10 @@ class LifeGate(core.Env):
 
     def step(self, action):
         assert action in self.legal_actions, 'Illegal action.'
+        truncated = False
         if self.step_id >= self.max_steps - 1:
             self.game_over = True
-            return self.get_obs(self.state_mode), 0., self.game_over, {}
+            return self.get_obs(self.state_mode), 0., self.game_over, truncated, {}
         self.step_id += 1
         self._move_player(action)
         if [self.player_pos_x, self.player_pos_y] == self.observability_switch_point and self.recovery_observablity == True:
@@ -228,7 +242,7 @@ class LifeGate(core.Env):
             reward = self.reward_scheme['recovery']
         else:
             reward = self.reward_scheme['step']
-        return self.get_obs(self.state_mode), reward, self.game_over, {}
+        return self.get_obs(self.state_mode), reward, self.game_over, truncated, {}
     
     def get_lives(self):
         if self.game_over == True:
@@ -259,9 +273,9 @@ class LifeGate(core.Env):
         return x
 
     def _get_tabular_obs(self):
-        state = np.array([self.player_pos_x, self.player_pos_y])
+        state = np.array([self.player_pos_x, self.player_pos_y], dtype=self.state_dtype)
         if self.cont_states:  # Add Gaussian perturbation to the true state (makes obs continuous)
-            state = state + np.random.normal(loc=0., scale=0.35, size=(2,))
+            state = state + np.random.normal(loc=0., scale=0.35, size=(2,)).astype(self.state_dtype)
         return state
 
     def _get_pixel_obs(self):

@@ -13,12 +13,13 @@ def worker(remote, parent_remote, env_fn_wrapper):
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
-            ob, reward, done, info = env.step(data)
+            ob, reward, terminated, truncated, info = env.step(data)
+            done = terminated or truncated
             if done:
-                ob = env.reset()
+                ob, _ = env.reset()
             remote.send((ob, reward, done, info))
         elif cmd == 'reset':
-            ob = env.reset()
+            ob, _ = env.reset()
             remote.send(ob)
         elif cmd == 'reset_task':
             ob = env.reset_task()
@@ -27,7 +28,7 @@ def worker(remote, parent_remote, env_fn_wrapper):
             remote.close()
             break
         elif cmd == "seed":
-            env.seed(data)
+            pass  # gymnasium handles seeding via reset(seed=...)
         elif cmd == 'get_spaces':
             remote.send((env.observation_space, env.action_space))
         else:
