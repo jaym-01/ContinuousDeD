@@ -1,17 +1,20 @@
 import torch
 from agent import IQN_Agent, DQN_Agent
+from agent_continuous import ContinuousIQN_Agent, ContinuousDQN_Agent
 import numpy as np
 import random
 import os
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import time
+import sys
 import gymnasium as gym
 import argparse
-import wrapper
 import MultiPro
 
-import LifeGate
+# Register "SpaceEnv-discrete-v0" by importing the SpaceEnv module
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'SpaceEnv'))
+import space_env  # noqa: F401
 
 def evaluate(eps, frame, eval_runs=5):
     """
@@ -24,7 +27,7 @@ def evaluate(eps, frame, eval_runs=5):
         rewards = 0
         while True:
             action = agent.act(np.expand_dims(state, axis=0), 0.001, eval=True)
-            state, reward, terminated, truncated, _ = eval_env.step(action[0].item())
+            state, reward, terminated, truncated, _ = eval_env.step(action[0])
             rewards += reward
             if terminated or truncated:
                 break
@@ -93,7 +96,7 @@ def run(frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.01, eval_every=1
 
 
 if __name__ == "__main__":
-    # LifeGate-v1 is registered automatically via `import LifeGate` above
+    # SpaceEnv-discrete-v0 is registered automatically via `import space_env` above
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-agent", type=str, choices=["iqn",
@@ -108,9 +111,12 @@ if __name__ == "__main__":
                                                      ], default="iqn", help="Specify which type of IQN agent you want to train, default is IQN - baseline!")
     
     parser.add_argument("-ded", action='store_true', default=False, help="Whether or not we'll estimate Q_d and Q_r as part of the DeD framework")
-    parser.add_argument("-env", type=str, default="BreakoutNoFrameskip-v4", help="Name of the Environment, default = BreakoutNoFrameskip-v4")
-    parser.add_argument("-drift", type=float, default=0.4, help="The probability of moving RIGHT no matter what in LifeGate-v1")
-    parser.add_argument("-state_mode", type=str, choices=["tabular", "vector", "pixel"], default="tabular", help="The state representation of LifeGate")
+    parser.add_argument("-env", type=str, default="SpaceEnv-discrete-v0", help="Gymnasium environment ID (default: SpaceEnv-discrete-v0)")
+    parser.add_argument("-n_bins", type=int, default=5, help="Bins per thrust axis for discrete action grid, e.g. 5 → 25 actions (default: 5)")
+    parser.add_argument("-action_mode", type=str, choices=["discrete", "continuous"], default="discrete",
+                        help="'discrete': n_bins grid wrapper (default); 'continuous': critic Q(s,a) with random-shooting action selection")
+    parser.add_argument("-K_actions", type=int, default=32,
+                        help="Candidate actions sampled per state in continuous mode (default: 32)")
     parser.add_argument("-frames", type=int, default=1000000, help="Number of frames to train, default = 1 mio")
     parser.add_argument("-eval_every", type=int, default=100000, help="Evaluate every x frames, default = 100000")
     parser.add_argument("-eval_runs", type=int, default=2, help="Number of evaluation runs, default = 2")
@@ -130,7 +136,6 @@ if __name__ == "__main__":
     parser.add_argument("-eps_frames", type=int, default=500000, help="Linear annealed frames for Epsilon, default = 500k")
     parser.add_argument("-min_eps", type=float, default = 0.01, help="Final epsilon greedy value, default = 0.01")
     parser.add_argument("-info", type=str, help="Name of the training run")
-    parser.add_argument("-cont_state", action='store_true', default=False, help="Whether we'll add some noise to the state observations to make them 'continuous'.")
     parser.add_argument("-save_model", type=int, choices=[0,1], default=1, help="Specify if the trained network shall be saved or not, default is 1 - save model!")
     parser.add_argument("-w", "--worker", type=int, default=1, help="Number of parallel Environments. Batch size increases proportional to number of worker. not recommended to have more than 4 worker, default = 1")
 
@@ -147,7 +152,6 @@ if __name__ == "__main__":
     LR = args.lr
     n_step = args.n_step
     env_name = args.env
-    cont_states = args.cont_state
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print("Using ", device)
 
@@ -155,89 +159,46 @@ if __name__ == "__main__":
     random.seed(seed)
     torch.manual_seed(seed)
 
-    random_state = np.random.RandomState(args.seed)
-
-    if args.env == 'LifeGate-v1':
-        # Initialize the LifeGate Tabular Environment (may use the vector based one?)
-        envs = MultiPro.SubprocVecEnv([lambda: gym.make(args.env, state_mode=args.state_mode, rng=random_state, death_drag=args.drift, cont_states=args.cont_state) for i in range(args.worker)])
-        eval_env = gym.make(args.env, state_mode=args.state_mode, rng=random_state, death_drag=args.drift, cont_states=args.cont_state)
-        action_size = len(eval_env.unwrapped.legal_actions)
-        state_size = (len(eval_env.unwrapped.tabular_state_shape),)  # Needs to be in tuple form for intializing the IQN model later
-    else:
-        if "-ram" in args.env or args.env == "CartPole-v0" or args.env == "LunarLander-v2": 
-            envs = MultiPro.SubprocVecEnv([lambda: gym.make(args.env) for i in range(args.worker)])
-            eval_env = gym.make(args.env)
-        else:
-            envs = MultiPro.SubprocVecEnv([lambda: wrapper.make_env(args.env) for i in range(args.worker)])
-            eval_env = wrapper.make_env(args.env)
-        # seed via env reset(seed=...) in gymnasium; legacy .seed() not supported
-
-
+    if args.action_mode == "discrete":
+        make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
+        envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
+        eval_env = make_env_fn()
         action_size = eval_env.action_space.n
-        state_size = eval_env.observation_space.shape
+    else:  # continuous
+        make_env_fn = lambda: gym.make("SpaceEnv-flat-v0")
+        envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
+        eval_env = make_env_fn()
+        action_size = eval_env.action_space.shape[0]  # action_dim (e.g. 2)
+    state_size = eval_env.observation_space.shape
 
-    if "dqn" in args.agent:
-        agent_def = DQN_Agent
-    else:
-        agent_def = IQN_Agent
-    
-    agent = agent_def(state_size=state_size,    
-                        action_size=action_size,
-                        network=args.agent,
-                        munchausen=args.munchausen,
-                        layer_size=args.layer_size,
-                        n_step=n_step,
-                        sided_Q='both',
-                        risk_measure=risk_measure,
-                        ETA=ETA,
-                        BATCH_SIZE=BATCH_SIZE, 
-                        BUFFER_SIZE=BUFFER_SIZE, 
-                        LR=LR, 
-                        TAU=TAU, 
-                        GAMMA=GAMMA,  
-                        N=args.N,
-                        worker=args.worker,
-                        device=device, 
-                        seed=seed)
-
-    if args.ded:  # If performing Dead-end Discovery, establish the Q_D and Q_R network
-        qd = agent_def(state_size=state_size,
-                       action_size=action_size,
-                       network=args.agent,
-                       munchausen=args.munchausen,
-                       layer_size=args.layer_size,
-                       n_step=n_step,
-                       sided_Q='negative',
-                       risk_measure=risk_measure,
-                       ETA=ETA,
-                       BATCH_SIZE=BATCH_SIZE,
-                       BUFFER_SIZE=BUFFER_SIZE,
-                       LR=LR,
-                       TAU=TAU,
-                       GAMMA=1.0,
-                       N=args.N,
-                       worker=args.worker,
-                       device=device,
-                       seed=seed)
-
-        qr = agent_def(state_size=state_size,
-                       action_size=action_size,
-                       network=args.agent,
-                       munchausen=args.munchausen,
-                       layer_size=args.layer_size,
-                       n_step=n_step,
-                       sided_Q='positive',
-                       risk_measure=risk_measure,
-                       ETA=ETA,
-                       BATCH_SIZE=BATCH_SIZE,
-                       BUFFER_SIZE=BUFFER_SIZE,
-                       LR=LR,
-                       TAU=TAU,
-                       GAMMA=1.0,
-                       N=args.N,
-                       worker=args.worker,
-                       device=device,
-                       seed=seed)
+    if args.action_mode == "discrete":
+        agent_def = DQN_Agent if "dqn" in args.agent else IQN_Agent
+        _common = dict(state_size=state_size, action_size=action_size,
+                       network=args.agent, munchausen=args.munchausen,
+                       layer_size=args.layer_size, n_step=n_step,
+                       risk_measure=risk_measure, ETA=ETA,
+                       BATCH_SIZE=BATCH_SIZE, BUFFER_SIZE=BUFFER_SIZE,
+                       LR=LR, TAU=TAU, N=args.N, worker=args.worker,
+                       device=device, seed=seed)
+        agent = agent_def(sided_Q='both',  GAMMA=GAMMA,  **_common)
+        if args.ded:
+            qd = agent_def(sided_Q='negative', GAMMA=1.0, **_common)
+            qr = agent_def(sided_Q='positive', GAMMA=1.0, **_common)
+    else:  # continuous
+        agent_def = ContinuousDQN_Agent if "dqn" in args.agent else ContinuousIQN_Agent
+        _common = dict(state_size=state_size, action_dim=action_size,
+                       action_low=eval_env.action_space.low,
+                       action_high=eval_env.action_space.high,
+                       network=args.agent, munchausen=args.munchausen,
+                       layer_size=args.layer_size, n_step=n_step,
+                       risk_measure=risk_measure, ETA=ETA,
+                       BATCH_SIZE=BATCH_SIZE, BUFFER_SIZE=BUFFER_SIZE,
+                       LR=LR, TAU=TAU, N=args.N, K_actions=args.K_actions,
+                       worker=args.worker, device=device, seed=seed)
+        agent = agent_def(sided_Q='both',  GAMMA=GAMMA,  **_common)
+        if args.ded:
+            qd = agent_def(sided_Q='negative', GAMMA=1.0, **_common)
+            qr = agent_def(sided_Q='positive', GAMMA=1.0, **_common)
 
 
 
