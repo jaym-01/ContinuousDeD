@@ -4,6 +4,9 @@ import random
 import torch
 
 
+Experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
+
+
 class ReplayBuffer:
     """Fixed-size buffer to store experience tuples."""
 
@@ -18,7 +21,7 @@ class ReplayBuffer:
         self.device = device
         self.memory = deque(maxlen=buffer_size)  
         self.batch_size = batch_size
-        self.experience = namedtuple("Experience", field_names=["state", "action", "reward", "next_state", "done"])
+        self.experience = Experience
         self.seed = random.seed(seed)
         self.gamma = gamma
         self.n_step = n_step
