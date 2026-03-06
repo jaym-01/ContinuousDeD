@@ -4,6 +4,7 @@ from agent_continuous import ContinuousIQN_Agent, ContinuousDQN_Agent
 import numpy as np
 import random
 import os
+import pickle
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import time
@@ -221,7 +222,12 @@ if __name__ == "__main__":
     
     print("Training time: {}min".format(round((t1-t0)/60,2)))
     if args.save_model:
-        torch.save(agent.qnetwork_local.state_dict(), os.path.join("runs", args.info, args.info+".pth"))
+        save_dir = os.path.join("runs", args.info)
+        with open(os.path.join(save_dir, args.info + "_agent.pkl"), "wb") as f:
+            pickle.dump(agent, f)
         if args.ded:
-            torch.save(qd.qnetwork_local.state_dict(), os.path.join("runs", args.info, args.info+'_Qd.pth'))
-            torch.save(qr.qnetwork_local.state_dict(), os.path.join("runs", args.info, args.info+'_Qr.pth'))
+            with open(os.path.join(save_dir, args.info + "_Qd.pkl"), "wb") as f:
+                pickle.dump(qd, f)
+            with open(os.path.join(save_dir, args.info + "_Qr.pkl"), "wb") as f:
+                pickle.dump(qr, f)
+        print("Saved agent(s) to", save_dir)

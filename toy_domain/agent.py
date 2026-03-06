@@ -68,6 +68,7 @@ class IQN_Agent():
         self.lo = -1   # Lower bound of value estimates when using Munchausen RL
         self.alpha = 0.9  # Scaling factor for additive Munchausen reward.
         self.GAMMA = GAMMA  # Discount factor
+        self.loss = []
         
         self.BATCH_SIZE = BATCH_SIZE * worker
         self.Q_updates = 0
@@ -121,6 +122,7 @@ class IQN_Agent():
                     loss = self.learn_per(experiences)
                 self.Q_updates += 1
                 writer.add_scalar("Q_loss", loss, self.Q_updates)
+                self.loss.append(loss)
 
     def act(self, state, eps=0., eval=False, use_drm=False):
         """Returns actions for given state as per current policy. Acting only every 4 frames!
@@ -167,7 +169,7 @@ class IQN_Agent():
             states, actions, rewards, next_states, dones = experiences
             # Get max predicted Q values (for next states) from target model
             Q_targets_next, _ = self.qnetwork_target(next_states, self.N) 
-            Q_targets_next = Q_targets_next.detach().cpu()
+            Q_targets_next = Q_targets_next.detach()
             action_indx = torch.argmax(Q_targets_next.mean(dim=1), dim=1, keepdim=True)
             Q_targets_next = Q_targets_next.gather(2, action_indx.unsqueeze(-1).expand(self.BATCH_SIZE, self.N, 1)).transpose(1,2)
             # Compute Q targets for current states, clamp Q_values depending on what 
@@ -413,6 +415,7 @@ class DQN_Agent():
         self.worker = worker
         self.UPDATE_EVERY = worker
         self.last_action = None
+        self.loss = []
 
         if "noisy" in self.network:
             noisy = True
@@ -459,6 +462,7 @@ class DQN_Agent():
                     loss = self.learn_per(experiences)
                 self.Q_updates += 1
                 writer.add_scalar("Q_loss", loss, self.Q_updates)
+                self.loss.append(loss)
 
     def act(self, state, eps=0., eval=False, **kwargs):
         """Returns actions for given state as per current policy. Acting only every 4 frames!
