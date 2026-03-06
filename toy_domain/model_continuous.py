@@ -100,7 +100,7 @@ class ContinuousIQN(nn.Module):
         if use_drm:
             taus = torch.from_numpy(self.drm(taus.numpy())).float()
         cos = torch.cos(taus.to(self.device) * self.pis)  # (batch, n_tau, n_cos)
-        return cos, taus
+        return cos, taus.to(self.device)
 
     def forward(self, state, action, num_tau=8, use_drm=False):
         """

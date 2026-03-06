@@ -266,7 +266,7 @@ class IQN_Agent():
 
                 # Get max predicted Q values (for next states) from target model
                 Q_targets_next, _ = self.qnetwork_target(next_states, self.N) 
-                Q_targets_next = Q_targets_next.detach().cpu()
+                Q_targets_next = Q_targets_next.detach()
                 action_indx = torch.argmax(Q_targets_next.mean(dim=1), dim=1, keepdim=True)
                 Q_targets_next = Q_targets_next.gather(2, action_indx.unsqueeze(-1).expand(self.BATCH_SIZE, self.N, 1)).transpose(1,2)
                 # Compute Q targets for current states 

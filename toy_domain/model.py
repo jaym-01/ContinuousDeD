@@ -200,7 +200,7 @@ class IQN(nn.Module):
         cos = torch.cos(taus.to(self.device)*self.pis)
 
         assert cos.shape == (batch_size,n_tau,self.n_cos), "cos shape is incorrect"
-        return cos, taus
+        return cos, taus.to(self.device)
     
     def forward(self, input, num_tau=8, use_drm=False):
         """
