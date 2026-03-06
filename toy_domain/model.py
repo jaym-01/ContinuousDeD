@@ -5,6 +5,28 @@ import numpy as np
 import math
 
 
+class _DRM:
+    """Picklable distortion risk measure callable."""
+    def __init__(self, name, eta):
+        self.name = name.lower()
+        self.eta = eta
+
+    def __call__(self, tau):
+        eta = self.eta
+        if self.name == 'cvar':
+            return tau * eta
+        elif self.name == 'cpw':
+            return tau**eta / (tau**eta + (1 - tau)**eta)**(1 / eta)
+        elif self.name == 'identity':
+            return tau
+        elif self.name == 'power':
+            if eta <= 0:
+                return 1 - (1 - tau)**(1 / (1 + abs(eta)))
+            else:
+                return tau**(1 / (1 + abs(eta)))
+        else:
+            raise Exception("The supplied DRM is not implemented. Current options: {CVaR, CPW, Identity, Power}")
+
 
 class NoisyLinear(nn.Linear):
     # Noisy Linear Layer for independent Gaussian Noise
@@ -169,21 +191,7 @@ class IQN(nn.Module):
             drm (str): The string representation of the DRM we want to use.
             eta (float): The scaling factor for the DRM. Default (0.71) is for CPW.
         """
-        if drm.lower() == 'cvar':
-            drm_func = lambda tau: tau*eta
-        elif drm.lower() == 'cpw':
-            drm_func = lambda tau: tau**eta / (tau**eta + (1-tau)**eta)**(1/eta)
-        elif drm.lower() == 'identity':
-            drm_func = lambda tau: tau
-        elif drm.lower() == 'power':
-            if eta <= 0:
-                drm_func = lambda tau: 1-(1-tau)**(1/(1+abs(eta)))
-            else:
-                drm_func = lambda tau: tau**(1/(1+abs(eta)))
-        else:
-            raise Exception("The supplied DRM is not implemented. Current options: {CVaR, CPW, Identity, Power}")
-
-        return np.vectorize(drm_func)
+        return _DRM(drm, eta)
     
     def calc_input_layer(self):
         x = torch.zeros(self.input_shape).unsqueeze(0)
@@ -196,7 +204,7 @@ class IQN(nn.Module):
         """
         taus = torch.rand(batch_size, n_tau).unsqueeze(-1) #(batch_size, n_tau, 1)  .to(self.device)
         if use_drm:
-            taus = torch.from_numpy(self.drm(taus)).type(torch.float)
+            taus = torch.from_numpy(self.drm(taus.numpy())).type(torch.float)
         cos = torch.cos(taus.to(self.device)*self.pis)
 
         assert cos.shape == (batch_size,n_tau,self.n_cos), "cos shape is incorrect"

@@ -26,6 +26,29 @@ import torch.nn as nn
 import numpy as np
 
 
+class _DRM:
+    """Picklable distortion risk measure callable."""
+    def __init__(self, name, eta):
+        self.name = name.lower()
+        self.eta = eta
+
+    def __call__(self, tau):
+        eta = self.eta
+        if self.name == 'cvar':
+            return tau * eta
+        elif self.name == 'cpw':
+            return tau**eta / (tau**eta + (1 - tau)**eta)**(1 / eta)
+        elif self.name == 'identity':
+            return tau
+        elif self.name == 'power':
+            if eta <= 0:
+                return 1 - (1 - tau)**(1 / (1 + abs(eta)))
+            else:
+                return tau**(1 / (1 + abs(eta)))
+        else:
+            raise ValueError(f"Unknown DRM: {self.name!r}. Options: identity, cvar, cpw, power")
+
+
 class ContinuousIQN(nn.Module):
     """IQN critic for continuous actions: Q(s,a) → distributional Z_τ(s,a).
 
@@ -78,22 +101,7 @@ class ContinuousIQN(nn.Module):
         self.ff_2 = nn.Linear(layer_size, 1)
 
     def _get_drm(self, drm, eta=0.71):
-        if drm.lower() == "cvar":
-            f = lambda tau: tau * eta
-        elif drm.lower() == "cpw":
-            f = lambda tau: tau**eta / (tau**eta + (1 - tau)**eta) ** (1 / eta)
-        elif drm.lower() == "identity":
-            f = lambda tau: tau
-        elif drm.lower() == "power":
-            if eta <= 0:
-                f = lambda tau: 1 - (1 - tau) ** (1 / (1 + abs(eta)))
-            else:
-                f = lambda tau: tau ** (1 / (1 + abs(eta)))
-        else:
-            raise ValueError(
-                f"Unknown DRM: {drm!r}. Options: identity, cvar, cpw, power"
-            )
-        return np.vectorize(f)
+        return _DRM(drm, eta)
 
     def calc_cos(self, batch_size, n_tau=8, use_drm=False):
         taus = torch.rand(batch_size, n_tau).unsqueeze(-1)  # (batch, n_tau, 1)

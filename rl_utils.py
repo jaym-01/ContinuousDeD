@@ -4,6 +4,29 @@ import gc
 import numpy as np
 import pandas as pd
 
+
+class _DRM:
+    """Picklable distortion risk measure callable."""
+    def __init__(self, name, eta):
+        self.name = name.lower()
+        self.eta = eta
+
+    def __call__(self, tau):
+        eta = self.eta
+        if self.name == 'cvar':
+            return tau * eta
+        elif self.name == 'cpw':
+            return tau**eta / (tau**eta + (1 - tau)**eta)**(1 / eta)
+        elif self.name == 'identity':
+            return tau
+        elif self.name == 'power':
+            if eta <= 0:
+                return 1 - (1 - tau)**(1 / (1 + abs(eta)))
+            else:
+                return tau**(1 / (1 + abs(eta)))
+        else:
+            raise Exception("The supplied DRM is not implemented. Current options: {CVaR, CPW, Identity, Power}")
+
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -490,21 +513,7 @@ class IQN(nn.Module):
             drm (str): The string representations of the DRM we want to use.
             eta (float): The scaling factor for the DRM> Default (0.71) is for CPW.
         """
-        if drm.lower == 'cvar':
-            drm_func = lambda tau: tau*eta
-        elif drm.lower() == 'cpw':
-            drm_func = lambda tau: tau**eta / (tau**eta + (1-tau)**eta)**(1/eta)
-        elif drm.lower() == 'identity':
-            drm_func = lambda tau: tau
-        elif drm_lower == 'power':
-            if eta <= 0:
-                drm_func = lambda tau: 1-(1-tau)**(1/(1+abs(eta)))
-            else:
-                drm_func = lambda tau: tau**(1/(1+abs(eta)))
-        else:
-            raise Exception("The supplied DRM is not implemented. Current options: {CVaR, CPW, Identity, Power}")
-        
-        return np.vectorize(drm_func)
+        return _DRM(drm, eta)
 
     def calc_cos(self, batch_size, n_tau=32, use_drm=False):
         """
@@ -513,7 +522,7 @@ class IQN(nn.Module):
         # Initialize the tau samples 
         taus = torch.rand(batch_size, n_tau).unsqueeze(-1)  # (batch_size, n_tau, 1)
         if use_drm: # Distort the tau samples if desired
-            taus = torch.from_numpy(self.drm(taus)).type(torch.float)
+            taus = torch.from_numpy(self.drm(taus.numpy())).type(torch.float)
         # Project the tau samples with the cosine transform
         cos = torch.cos(taus.to(self.device)*self.pis)
 
