@@ -13,6 +13,13 @@ import gymnasium as gym
 import argparse
 import MultiPro
 
+ANCHOR_STATES = [
+    [8.0, 5.0, -0.484, 0.0],  # State A: 5% dead-end fraction
+    [8.0, 5.0, -0.526, 0.0],  # State B: 45% dead-end fraction
+    [8.0, 5.0, -0.566, 0.0],  # State C: 85% dead-end fraction
+]
+ANCHOR_RATIO = 0.3  # 30% of episodes start from anchor states
+
 # Register "SpaceEnv-discrete-v0" by importing the SpaceEnv module
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'SpaceEnv'))
 import space_env  # noqa: F401
@@ -90,7 +97,11 @@ def run(frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.01, eval_every=1
             if i_episode % 100 == 0:
                 print('\rEpisode {}\tFrame {}\tAverage100 Score: {:.2f}'.format(i_episode*worker, frame*worker, np.mean(scores_window)))
             i_episode +=1 
-            state = envs.reset()
+            if random.random() < ANCHOR_RATIO:
+                anchor = random.choice(ANCHOR_STATES)
+                state = envs.reset_to_state(anchor)
+            else:
+                state = envs.reset()
             score = 0              
 
 
@@ -153,7 +164,8 @@ if __name__ == "__main__":
     LR = args.lr
     n_step = args.n_step
     env_name = args.env
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+
     print("Using ", device)
 
     np.random.seed(seed)

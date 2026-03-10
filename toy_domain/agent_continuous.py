@@ -23,6 +23,9 @@ from collections import deque, namedtuple
 
 from model_continuous import ContinuousIQN, ContinuousDQN
 
+Experience = namedtuple(
+    "Experience", field_names=["state", "action", "reward", "next_state", "done"]
+)
 
 # ---------------------------------------------------------------------------
 # Shared utilities
@@ -47,9 +50,7 @@ class ContinuousReplayBuffer:
         self.device = device
         self.memory = deque(maxlen=buffer_size)
         self.batch_size = batch_size
-        self.experience = namedtuple(
-            "Experience", field_names=["state", "action", "reward", "next_state", "done"]
-        )
+        self.experience = Experience
         self.seed = random.seed(seed)
         self.gamma = gamma
         self.n_step = n_step

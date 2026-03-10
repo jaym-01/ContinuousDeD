@@ -116,10 +116,17 @@ class SpaceEnv(gym.Env):
         super().reset(seed=seed)
         self.step_counter = 0
 
-        start_x = self.np_random.uniform(0.1, 1.0)
-        start_y = self.np_random.uniform(0.1, 1.0)
-        self._agent_position = np.array([start_x, start_y], dtype=np.float32)
-        self._agent_velocity = np.array([0.0, 0.0], dtype=np.float32)
+        # If a start_state is provided, use it
+        if options is not None and "start_state" in options:
+            s = options["start_state"]
+            self._agent_position = np.array([s[0], s[1]], dtype=np.float32)
+            self._agent_velocity = np.array([s[2], s[3]], dtype=np.float32)
+        else:
+
+            start_x = self.np_random.uniform(0.1, 1.0)
+            start_y = self.np_random.uniform(0.1, 1.0)
+            self._agent_position = np.array([start_x, start_y], dtype=np.float32)
+            self._agent_velocity = np.array([0.0, 0.0], dtype=np.float32)
 
         self._target_position = np.array([9.5, 9.5], dtype=np.float32)
         self._planet_positions = np.full(
