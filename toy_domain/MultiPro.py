@@ -31,6 +31,9 @@ def worker(remote, parent_remote, env_fn_wrapper):
             pass  # gymnasium handles seeding via reset(seed=...)
         elif cmd == 'get_spaces':
             remote.send((env.observation_space, env.action_space))
+        elif cmd == 'reset_to_state':
+            ob, _ = env.reset(options={"start_state": data})
+            remote.send(ob)
         else:
             raise NotImplementedError
 
@@ -160,3 +163,8 @@ class SubprocVecEnv(VecEnv):
             
     def __len__(self):
         return self.nenvs
+    
+    def reset_to_state(self, start_state):
+        for remote in self.remotes:
+            remote.send(('reset_to_state', start_state))
+        return np.stack([remote.recv() for remote in self.remotes])
