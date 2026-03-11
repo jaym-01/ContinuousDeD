@@ -44,8 +44,20 @@ def evaluate(eps, frame, eval_runs=5):
     writer.add_scalar("Reward", np.mean(reward_batch), frame)
 
 
+def save_agents(agent, qd, qr):
+    save_dir = os.path.join("runs", args.info)
+    with open(os.path.join(save_dir, args.info + "_agent.pkl"), "wb") as f:
+        pickle.dump(agent, f)
+    if args.ded and qd is not None and qr is not None:
+        with open(os.path.join(save_dir, args.info + "_Qd.pkl"), "wb") as f:
+            pickle.dump(qd, f)
+        with open(os.path.join(save_dir, args.info + "_Qr.pkl"), "wb") as f:
+            pickle.dump(qr, f)
+    print("Saved agent(s) to", save_dir)
 
-def run(frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.01, eval_every=1000, eval_runs=5, worker=1, use_drm=False):
+
+
+def run(agent, qd, qr, frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.01, eval_every=1000, eval_runs=5, worker=1, use_drm=False):
     """Deep Q-Learning.
     
     Params
@@ -102,7 +114,11 @@ def run(frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.01, eval_every=1
                 state = envs.reset_to_state(anchor)
             else:
                 state = envs.reset()
-            score = 0              
+            score = 0
+
+        if frame % 1000 == 0:
+            save_agents(agent, qd, qr)
+
 
 
 
@@ -137,6 +153,7 @@ if __name__ == "__main__":
     parser.add_argument("-use_drm", action='store_true', default=False, help="Whether we'll use the distortion risk measure when selecting actions with the policy")
     parser.add_argument("-drm", type=str, default='identity', choices=['identity','cvar','cpw','power'], help="The distortion risk measure used to transform the sampling distribution of the Value function distribution")
     parser.add_argument("-eta", type=float, default=0.71, help="The scaling factor for the selected distortion risk measure")
+    parser.add_argument("-alpha", type=float, default=0.2, help="Entropy temperature for DSAC (continuous IQN actor); higher = more exploration, default = 0.2")
     parser.add_argument("-munchausen", type=int, default=0, choices=[0,1], help="Use Munchausen RL loss for training if set to 1 (True), default = 0")
     parser.add_argument("-bs", "--batch_size", type=int, default=32, help="Batch size for updating the DQN, default = 32")
     parser.add_argument("-layer_size", type=int, default=512, help="Size of the hidden layer, default=512")
@@ -184,6 +201,8 @@ if __name__ == "__main__":
         action_size = eval_env.action_space.shape[0]  # action_dim (e.g. 2)
     state_size = eval_env.observation_space.shape
 
+    qr = None
+    qd = None
     if args.action_mode == "discrete":
         agent_def = DQN_Agent if "dqn" in args.agent else IQN_Agent
         _common = dict(state_size=state_size, action_size=action_size,
@@ -208,10 +227,10 @@ if __name__ == "__main__":
                        BATCH_SIZE=BATCH_SIZE, BUFFER_SIZE=BUFFER_SIZE,
                        LR=LR, TAU=TAU, N=args.N, K_actions=args.K_actions,
                        worker=args.worker, device=device, seed=seed)
-        agent = agent_def(sided_Q='both',  GAMMA=GAMMA,  **_common)
+        agent = agent_def(sided_Q='both',  GAMMA=GAMMA, ALPHA=args.alpha, use_actor=True,  **_common)
         if args.ded:
-            qd = agent_def(sided_Q='negative', GAMMA=1.0, **_common)
-            qr = agent_def(sided_Q='positive', GAMMA=1.0, **_common)
+            qd = agent_def(sided_Q='negative', GAMMA=1.0, use_actor=False, **_common)
+            qr = agent_def(sided_Q='positive', GAMMA=1.0, use_actor=False, **_common)
 
 
 
@@ -222,7 +241,7 @@ if __name__ == "__main__":
         eps_fixed = False
 
     t0 = time.time()
-    run(frames = args.frames//args.worker, 
+    run(agent, qd, qr, frames = args.frames//args.worker, 
         eps_fixed=eps_fixed, 
         eps_frames=args.eps_frames//args.worker, 
         min_eps=args.min_eps, 
@@ -233,13 +252,4 @@ if __name__ == "__main__":
     t1 = time.time()
     
     print("Training time: {}min".format(round((t1-t0)/60,2)))
-    if args.save_model:
-        save_dir = os.path.join("runs", args.info)
-        with open(os.path.join(save_dir, args.info + "_agent.pkl"), "wb") as f:
-            pickle.dump(agent, f)
-        if args.ded:
-            with open(os.path.join(save_dir, args.info + "_Qd.pkl"), "wb") as f:
-                pickle.dump(qd, f)
-            with open(os.path.join(save_dir, args.info + "_Qr.pkl"), "wb") as f:
-                pickle.dump(qr, f)
-        print("Saved agent(s) to", save_dir)
+    save_agents(agent, qd, qr)

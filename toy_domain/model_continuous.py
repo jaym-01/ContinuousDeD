@@ -1,28 +1,13 @@
 """
-Continuous-action critic networks for IQN and DQN.
-
-Unlike the discrete variants in model.py (which output Q-values for every action),
-these networks take (state, action) as joint input and output a scalar Q(s,a).
-
-Architecture follows DSAC (Distributional Soft Actor-Critic):
-  - State and action are concatenated and encoded via a shared linear layer.
-  - For IQN: the state-action encoding is element-wise multiplied with a cosine
-    quantile embedding (identical to the original IQN cosine trick), producing a
-    scalar quantile estimate Z_τ(s,a).
-  - For DQN: a plain 2-layer MLP producing a scalar Q(s,a).
-
-Action selection in both cases is done externally by the agent via uniform
-random shooting: sample K candidate actions, evaluate Q(s,a_i) for each,
-return the argmax action.
-
-References
-----------
 DSAC: https://arxiv.org/abs/2004.14547
 IQN:  https://arxiv.org/abs/1806.06923
 """
 
+import math
+
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 
@@ -190,3 +175,74 @@ class ContinuousDQN(nn.Module):
     def get_qvalue(self, state, action, use_drm=False):
         """Returns (batch, 1). use_drm ignored (no quantile distribution)."""
         return self.forward(state, action)
+
+
+class GaussianActor(nn.Module):
+    """Stochastic Gaussian actor for continuous action spaces (DSAC).
+
+    Outputs a squashed Gaussian policy: actions are sampled via the
+    reparameterisation trick, then passed through tanh and scaled to [low, high].
+
+    Parameters
+    ----------
+    state_size  : tuple, e.g. (4,)
+    action_dim  : int
+    layer_size  : int — hidden layer width
+    action_low  : array-like — per-dimension lower bounds
+    action_high : array-like — per-dimension upper bounds
+    seed        : int
+    """
+
+    LOG_STD_MIN = -20
+    LOG_STD_MAX = 2
+
+    def __init__(self, state_size, action_dim, layer_size, action_low, action_high, seed):
+        super(GaussianActor, self).__init__()
+        self.seed = torch.manual_seed(seed)
+        state_dim = state_size[0]
+
+        self.head = nn.Linear(state_dim, layer_size)
+        self.ff_1 = nn.Linear(layer_size, layer_size)
+        self.mean_head = nn.Linear(layer_size, action_dim)
+        self.log_std_head = nn.Linear(layer_size, action_dim)
+
+        # Buffers move to device with .to(device) and are preserved by pickle
+        scale = torch.FloatTensor((np.array(action_high) - np.array(action_low)) / 2.0)
+        bias = torch.FloatTensor((np.array(action_high) + np.array(action_low)) / 2.0)
+        self.register_buffer('scale', scale)
+        self.register_buffer('bias', bias)
+        # Log-prob correction for the linear scaling is a constant
+        self.log_scale_sum = float(torch.log(scale).sum())
+
+    def forward(self, state):
+        """Returns (mean, log_std) of the un-squashed Gaussian. Shapes: (batch, action_dim)."""
+        x = torch.relu(self.head(state))
+        x = torch.relu(self.ff_1(x))
+        mean = self.mean_head(x)
+        log_std = self.log_std_head(x).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
+        return mean, log_std
+
+    def sample(self, state):
+        """Reparameterised sample + tanh squash + scale to action bounds.
+
+        Returns
+        -------
+        action   : (batch, action_dim) — scaled to [low, high]
+        log_prob : (batch,) — log-probability under the policy
+        """
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
+        dist = torch.distributions.Normal(mean, std)
+        u = dist.rsample()  # reparameterised: enables gradient through sample
+
+        # Tanh squash then scale to action bounds
+        a_raw = torch.tanh(u)                    # ∈ (-1, 1)
+        action = a_raw * self.scale + self.bias  # ∈ [low, high]
+
+        # Log-prob: Gaussian - tanh Jacobian - linear scaling constant
+        # Numerically stable: log(1 - tanh²(u)) = 2*(log2 - u - softplus(-2u))
+        log_prob = dist.log_prob(u).sum(-1)
+        log_prob -= (2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))).sum(-1)
+        log_prob -= self.log_scale_sum
+
+        return action, log_prob
