@@ -10,7 +10,7 @@ Experience = namedtuple("Experience", field_names=["state", "action", "reward", 
 class ReplayBuffer:
     """Fixed-size buffer to store experience tuples."""
 
-    def __init__(self, buffer_size, batch_size, device, seed, gamma, n_step=1, parallel_env=4):
+    def __init__(self, buffer_size, batch_size, device, seed, gamma, n_step=1, parallel_env=4, continuous=False):
         """Initialize a ReplayBuffer object.
         Params
         ======
@@ -28,6 +28,7 @@ class ReplayBuffer:
         self.parallel_env = parallel_env
         self.n_step_buffer = [deque(maxlen=self.n_step) for i in range(parallel_env)]
         self.iter_ = 0
+        self.continuous = continuous
     
     def add(self, state, action, reward, next_state, done):
         """Add a new experience to memory."""
@@ -56,7 +57,10 @@ class ReplayBuffer:
         experiences = random.sample(self.memory, k=self.batch_size)
 
         states = torch.from_numpy(np.stack([e.state for e in experiences if e is not None])).float().to(self.device)
-        actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).long().to(self.device)
+        if self.continuous:
+            actions = torch.from_numpy(np.stack([e.action for e in experiences if e is not None])).float().to(self.device)
+        else:
+            actions = torch.from_numpy(np.vstack([e.action for e in experiences if e is not None])).long().to(self.device)
         rewards = torch.from_numpy(np.vstack([e.reward for e in experiences if e is not None])).float().to(self.device)
         next_states = torch.from_numpy(np.stack([e.next_state for e in experiences if e is not None])).float().to(self.device)
         dones = torch.from_numpy(np.vstack([e.done for e in experiences if e is not None]).astype(np.uint8)).float().to(self.device)
