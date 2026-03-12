@@ -47,11 +47,10 @@ class ReplayBuffer:
         Return = 0
         for idx in range(self.n_step):
             Return += self.gamma**idx * n_step_buffer[idx][2]
-        
+            if n_step_buffer[idx][4]:  # done=True: episode ended, stop here
+                return n_step_buffer[0][0], n_step_buffer[0][1], Return, n_step_buffer[idx][3], n_step_buffer[idx][4]
         return n_step_buffer[0][0], n_step_buffer[0][1], Return, n_step_buffer[-1][3], n_step_buffer[-1][4]
-        
-    
-    
+
     def sample(self):
         """Randomly sample a batch of experiences from memory."""
         experiences = random.sample(self.memory, k=self.batch_size)
@@ -92,13 +91,14 @@ class PrioritizedReplay(object):
         self.iter_ = 0
         self.gamma = gamma
 
-    def calc_multistep_return(self,n_step_buffer):
+    def calc_multistep_return(self, n_step_buffer):
         Return = 0
         for idx in range(self.n_step):
             Return += self.gamma**idx * n_step_buffer[idx][2]
-        
+            if n_step_buffer[idx][4]:  # done=True: episode ended, stop here
+                return n_step_buffer[0][0], n_step_buffer[0][1], Return, n_step_buffer[idx][3], n_step_buffer[idx][4]
         return n_step_buffer[0][0], n_step_buffer[0][1], Return, n_step_buffer[-1][3], n_step_buffer[-1][4]
-    
+
     def beta_by_frame(self, frame_idx):
         """
         Linearly increases beta from beta_start to 1 over time from 1 to beta_frames.
