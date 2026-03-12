@@ -18,7 +18,6 @@ ANCHOR_STATES = [
     [8.0, 5.0, -0.526, 0.0],  # State B: 45% dead-end fraction
     [8.0, 5.0, -0.566, 0.0],  # State C: 85% dead-end fraction
 ]
-ANCHOR_RATIO = 0.3  # 30% of episodes start from anchor states
 
 # Register "SpaceEnv-discrete-v0" by importing the SpaceEnv module
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'SpaceEnv'))
@@ -57,7 +56,7 @@ def save_agents(agent, qd, qr):
 
 
 
-def run(agent, qd, qr, frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.01, eval_every=1000, eval_runs=5, worker=1, use_drm=False):
+def run(agent, qd, qr, frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.01, eval_every=1000, eval_runs=5, worker=1, use_drm=False, anchor_ratio=0.3):
     """Deep Q-Learning.
     
     Params
@@ -109,7 +108,7 @@ def run(agent, qd, qr, frames=1000, eps_fixed=False, eps_frames=1e6, min_eps=0.0
             if i_episode % 100 == 0:
                 print('\rEpisode {}\tFrame {}\tAverage100 Score: {:.2f}'.format(i_episode*worker, frame*worker, np.mean(scores_window)))
             i_episode +=1 
-            if random.random() < ANCHOR_RATIO:
+            if random.random() < anchor_ratio:
                 anchor = random.choice(ANCHOR_STATES)
                 state = envs.reset_to_state(anchor)
             else:
@@ -163,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("-g", "--gamma", type=float, default=0.99, help="Discount factor gamma, default = 0.99")
     parser.add_argument("-t", "--tau", type=float, default=1e-3, help="Soft update parameter tau, default = 1e-3")
     parser.add_argument("-eps_frames", type=int, default=500000, help="Linear annealed frames for Epsilon, default = 500k")
+    parser.add_argument("-anchor_ratio", type=float, default=0.3, help="Ratio of episodes that start from anchor states, default = 0.3")
     parser.add_argument("-min_eps", type=float, default = 0.01, help="Final epsilon greedy value, default = 0.01")
     parser.add_argument("-info", type=str, help="Name of the training run")
     parser.add_argument("-save_model", type=int, choices=[0,1], default=1, help="Specify if the trained network shall be saved or not, default is 1 - save model!")
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     seed = args.seed
     risk_measure = args.drm
     ETA = args.eta
-    use_drm = args.use_drm
+    use_drm_ = args.use_drm
     BUFFER_SIZE = args.memory_size
     BATCH_SIZE = args.batch_size
     GAMMA = args.gamma
@@ -248,7 +248,8 @@ if __name__ == "__main__":
         eval_every=args.eval_every//args.worker, 
         eval_runs=args.eval_runs, 
         worker=args.worker,
-        use_drm=use_drm)
+        use_drm=use_drm_,
+        anchor_ratio=args.anchor_ratio)
     t1 = time.time()
     
     print("Training time: {}min".format(round((t1-t0)/60,2)))
