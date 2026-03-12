@@ -172,16 +172,15 @@ class SpaceEnv(gym.Env):
         )
 
         crash = bool(np.any(self.distance_to_planets <= self.planet_specs[:, 0]))
-        if (
+        out_of_bounds = (
             self._agent_position[0] > self.size
             or self._agent_position[0] < 0
             or self._agent_position[1] > self.size
             or self._agent_position[1] < 0
-        ):
-            crash = True
+        )
 
         terminated = success or crash
-        truncated = self.step_counter >= 200
+        truncated = (self.step_counter >= 200) or out_of_bounds
         reward = 1.0 if success else -1.0 if crash else 0.0
 
         self.step_counter += 1
