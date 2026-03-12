@@ -95,6 +95,19 @@ class ContinuousIQN(nn.Module):
         cos = torch.cos(taus.to(self.device) * self.pis)  # (batch, n_tau, n_cos)
         return cos, taus.to(self.device)
 
+    # Fixed normalisation constants for SpaceEnv (map 10×10, actions ±0.5)
+    # Brings all inputs to roughly [-1, 1] so no single feature dominates.
+    _S_MEAN  = torch.tensor([5.0,  5.0,  0.0,  0.0])   # (x,y,vx,vy) centres
+    _S_SCALE = torch.tensor([5.0,  5.0,  2.0,  2.0])   # (x,y,vx,vy) half-ranges
+    _A_SCALE = torch.tensor([0.5,  0.5])                # action half-ranges
+
+    def _normalise(self, state, action):
+        """Normalise (state, action) to ~ [-1, 1] per dimension."""
+        dev = state.device
+        s = (state  - self._S_MEAN.to(dev)) / self._S_SCALE.to(dev)
+        a =  action / self._A_SCALE.to(dev)
+        return torch.cat([s, a], dim=-1)
+
     def forward(self, state, action, num_tau=8, use_drm=False):
         """
         Parameters
@@ -109,9 +122,9 @@ class ContinuousIQN(nn.Module):
         """
         batch_size = state.shape[0]
 
-        # Encode state-action pair
+        # Encode normalised state-action pair
         x = torch.relu(
-            self.head(torch.cat([state, action], dim=-1))
+            self.head(self._normalise(state, action))
         )  # (batch, layer_size)
 
         # Cosine quantile embedding
