@@ -269,6 +269,14 @@ class ContinuousIQN_Agent:
             * (1.0 - dones.unsqueeze(-1))
         )
 
+        # Clamp the final target so n-step accumulation can't push below true bounds
+        if self.sided_Q == "negative":
+            Q_targets = torch.clamp(Q_targets, max=0.0, min=-1.0)
+        elif self.sided_Q == "positive":
+            Q_targets = torch.clamp(Q_targets, max=1.0, min=0.0)
+        else:
+            Q_targets = torch.clamp(Q_targets, max=1.0, min=-1.0)
+
         # --- Critic loss: cross-quantile Huber (identical structure to discrete IQN) ---
         Q_expected, taus = self.qnetwork_local(states, actions, self.N)
         # Q_expected: (batch, N, 1),  taus: (batch, N, 1)
