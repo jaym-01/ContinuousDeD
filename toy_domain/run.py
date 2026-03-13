@@ -28,6 +28,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import grid_nav_env  # noqa: F401
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGrid'))
 import med_grid_env  # noqa: F401
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'TwoDrug'))
+import env as _twodrug_env  # noqa: F401
 
 def evaluate(eps, frame, eval_runs=5):
     """
@@ -228,10 +230,23 @@ if __name__ == "__main__":
                 _sys.path.insert(0, _medgrid_path)
                 import med_grid_env  # noqa: F401
                 return gym.make("MedGrid-discrete-v0", n_bins=args.n_bins, scale=_medgrid_scale)
+        elif args.env == "TwoDrug":
+            _twodrug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'TwoDrug')
+            _n_bins = args.n_bins
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _twodrug_path)
+                import env as _td  # noqa: F401
+                return _td.TwoDrugEnv(discrete_bins=_n_bins, random_start_severity=True)
+            def make_eval_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _twodrug_path)
+                import env as _td  # noqa: F401
+                return _td.TwoDrugEnv(discrete_bins=_n_bins)
         else:
             make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
-        eval_env = make_env_fn()
+        eval_env = make_eval_env_fn() if args.env == "TwoDrug" else make_env_fn()
         action_size = eval_env.action_space.n
     else:  # continuous
         if args.env == "GridNav":
@@ -250,15 +265,27 @@ if __name__ == "__main__":
                 _sys.path.insert(0, _medgrid_path)
                 import med_grid_env  # noqa: F401
                 return gym.make("MedGrid-v0", scale=_medgrid_scale)
+        elif args.env == "TwoDrug":
+            _twodrug_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'TwoDrug')
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _twodrug_path)
+                import env as _td  # noqa: F401
+                return _td.TwoDrugEnv(random_start_severity=True)
+            def make_eval_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _twodrug_path)
+                import env as _td  # noqa: F401
+                return _td.TwoDrugEnv()
         else:
             make_env_fn = lambda: gym.make("SpaceEnv-flat-v0")
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
-        eval_env = make_env_fn()
+        eval_env = make_eval_env_fn() if args.env == "TwoDrug" else make_env_fn()
         action_size = eval_env.action_space.shape[0]  # action_dim (e.g. 2)
     state_size = eval_env.observation_space.shape
 
     # State normalisation bounds for continuous agents (None = use SpaceEnv defaults)
-    if args.action_mode == "continuous" and args.env in ("GridNav", "MedGrid"):
+    if args.action_mode == "continuous" and args.env in ("GridNav", "MedGrid", "TwoDrug"):
         _state_low  = eval_env.observation_space.low.tolist()
         _state_high = eval_env.observation_space.high.tolist()
     else:
@@ -313,7 +340,7 @@ if __name__ == "__main__":
         eval_runs=args.eval_runs, 
         worker=args.worker,
         use_drm=use_drm_,
-        anchor_ratio=0.0 if args.env in ("LifeGate", "GridNav", "MedGrid") else args.anchor_ratio)
+        anchor_ratio=0.0 if args.env in ("LifeGate", "GridNav", "MedGrid", "TwoDrug") else args.anchor_ratio)
     t1 = time.time()
     
     print("Training time: {}min".format(round((t1-t0)/60,2)))
