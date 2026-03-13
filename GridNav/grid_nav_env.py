@@ -10,21 +10,34 @@ class GridNavEnv(gym.Env):
     Action: (x_target, y_target) ∈ [0, 4]² — desired next position (direct teleport).
 
     Zones (evaluated on s_{t+1}):
-        Death    (Red):    x ∈ [0,1], y ∈ [3,4]  → r=-1, terminated=True
-        Trap     (Yellow): x ∈ [0,1], y ∈ [2,3)  → r=0,  terminated=False
-        Recovery (Blue):   x ∈ [3,4], y ∈ [2,4]  → r=+1, terminated=True
-        Neutral  (White):  elsewhere               → r=0,  terminated=False
+        Death    (Red):    x ∈ [0, z], y ∈ [4-z, 4]      → r=-1, terminated=True
+        Trap     (Yellow): x ∈ [0, z], y ∈ [4-2z, 4-z)   → r=0,  terminated=False
+        Recovery (Blue):   x ∈ [3,4],  y ∈ [2,4]         → r=+1, terminated=True
+        Neutral  (White):  elsewhere                       → r=0,  terminated=False
+
+    where z = sqrt(dead_end_pct / 2 * SIZE²) is the zone side length derived
+    from `dead_end_pct` (fraction in [0,1] of total grid area occupied by death+trap combined).
+    Default dead_end_pct=0.125 reproduces the original 1×1 zones.
 
     Trap mechanism: if s_t is in Trap, the action is ignored and the agent is
-    forced to s_{t+1} = (0.5, 3.5) — the centre of the Death zone.
+    forced to s_{t+1} = (z/2, SIZE-z/2) — the centre of the Death zone.
     """
 
     SIZE = 4.0
     START = np.array([1.0, 1.0], dtype=np.float32)
     MAX_STEPS = 200
 
-    def __init__(self):
+    def __init__(self, dead_end_pct: float = 0.125):
         super().__init__()
+        # Each zone (death, trap) occupies half of dead_end_pct of the total grid area.
+        zone_area = (dead_end_pct / 2.0) * (self.SIZE ** 2)
+        self._z = float(np.sqrt(zone_area))  # side length of each square zone
+        self._death_y_lo = self.SIZE - self._z
+        self._trap_y_lo = self.SIZE - 2 * self._z
+        self._death_center = np.array(
+            [self._z / 2, self.SIZE - self._z / 2], dtype=np.float32
+        )
+
         self.observation_space = spaces.Box(
             low=np.zeros(2, dtype=np.float32),
             high=np.full(2, self.SIZE, dtype=np.float32),
@@ -39,10 +52,10 @@ class GridNavEnv(gym.Env):
         self.steps = 0
 
     def _in_death(self, s):
-        return s[0] <= 1.0 and s[1] >= 3.0
+        return s[0] <= self._z and s[1] >= self._death_y_lo
 
     def _in_trap(self, s):
-        return s[0] <= 1.0 and 2.0 <= s[1] < 3.0
+        return s[0] <= self._z and self._trap_y_lo <= s[1] < self._death_y_lo
 
     def _in_recovery(self, s):
         return s[0] >= 3.0 and s[1] >= 2.0
@@ -55,7 +68,7 @@ class GridNavEnv(gym.Env):
 
     def step(self, action):
         if self._in_trap(self.state):
-            next_state = np.array([0.5, 3.5], dtype=np.float32)
+            next_state = self._death_center.copy()
         else:
             next_state = np.clip(
                 np.array(action, dtype=np.float32), 0.0, self.SIZE

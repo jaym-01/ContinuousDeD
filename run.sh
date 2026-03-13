@@ -14,9 +14,5 @@
 # LifeGate discrete
 # .venv/bin/python toy_domain/run.py -env LifeGate -action_mode discrete -agent iqn -ded -frames 10000 -info lifegate_iqn
 
-# GridNav continuous (verify startup)
-.venv/bin/python toy_domain/run.py -env GridNav -action_mode continuous -agent iqn -frames 100000 -info gridnav_iqn -ded
-
-.venv/bin/python toy_domain/run.py -env GridNav -action_mode continuous -agent iqn -frames 200000 -info gridnav_iqn_2 -ded
-
-.venv/bin/python toy_domain/run.py -env GridNav -action_mode continuous -agent iqn -frames 1000000 -info gridnav_iqn_3 -ded
+# GridNav continuous
+.venv/bin/python toy_domain/run.py -env GridNav -action_mode continuous -agent iqn -frames 100000 -info gridnav_iqn -ded -dead_end_pct 0.01
