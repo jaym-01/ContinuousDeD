@@ -24,6 +24,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 import space_env  # noqa: F401
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'LifeGate'))
 import LifeGate as _lifegate  # noqa: F401
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'GridNav'))
+import grid_nav_env  # noqa: F401
 
 def evaluate(eps, frame, eval_runs=5):
     """
@@ -205,11 +207,26 @@ if __name__ == "__main__":
         eval_env = make_env_fn()
         action_size = eval_env.action_space.n
     else:  # continuous
-        make_env_fn = lambda: gym.make("SpaceEnv-flat-v0")
+        if args.env == "GridNav":
+            _gridnav_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'GridNav')
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _gridnav_path)
+                import grid_nav_env  # noqa: F401
+                return gym.make("GridNav-v0")
+        else:
+            make_env_fn = lambda: gym.make("SpaceEnv-flat-v0")
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
         eval_env = make_env_fn()
         action_size = eval_env.action_space.shape[0]  # action_dim (e.g. 2)
     state_size = eval_env.observation_space.shape
+
+    # State normalisation bounds for continuous agents (None = use SpaceEnv defaults)
+    if args.action_mode == "continuous" and args.env == "GridNav":
+        _state_low  = eval_env.observation_space.low.tolist()
+        _state_high = eval_env.observation_space.high.tolist()
+    else:
+        _state_low = _state_high = None
 
     qr = None
     qd = None
@@ -236,7 +253,8 @@ if __name__ == "__main__":
                        risk_measure=risk_measure, ETA=ETA,
                        BATCH_SIZE=BATCH_SIZE, BUFFER_SIZE=BUFFER_SIZE,
                        LR=LR, TAU=TAU, N=args.N, K_actions=args.K_actions,
-                       worker=args.worker, device=device, seed=seed)
+                       worker=args.worker, device=device, seed=seed,
+                       state_low=_state_low, state_high=_state_high)
         agent = agent_def(sided_Q='both',  GAMMA=GAMMA, ALPHA=args.alpha, use_actor=True,  **_common)
         if args.ded:
             qd = agent_def(sided_Q='negative', GAMMA=1.0, use_actor=False, **_common)
@@ -259,7 +277,7 @@ if __name__ == "__main__":
         eval_runs=args.eval_runs, 
         worker=args.worker,
         use_drm=use_drm_,
-        anchor_ratio=0.0 if args.env == "LifeGate" else args.anchor_ratio)
+        anchor_ratio=0.0 if args.env in ("LifeGate", "GridNav") else args.anchor_ratio)
     t1 = time.time()
     
     print("Training time: {}min".format(round((t1-t0)/60,2)))
