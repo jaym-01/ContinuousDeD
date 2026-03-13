@@ -22,6 +22,8 @@ ANCHOR_STATES = [
 # Register "SpaceEnv-discrete-v0" by importing the SpaceEnv module
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'SpaceEnv'))
 import space_env  # noqa: F401
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'LifeGate'))
+import LifeGate as _lifegate  # noqa: F401
 
 def evaluate(eps, frame, eval_runs=5):
     """
@@ -190,7 +192,10 @@ if __name__ == "__main__":
     torch.manual_seed(seed)
 
     if args.action_mode == "discrete":
-        make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
+        if args.env == "LifeGate":
+            make_env_fn = lambda: gym.make("LifeGate-v1", state_mode="tabular", rng=np.random.RandomState(), death_drag=0.0)
+        else:
+            make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
         eval_env = make_env_fn()
         action_size = eval_env.action_space.n
@@ -249,7 +254,7 @@ if __name__ == "__main__":
         eval_runs=args.eval_runs, 
         worker=args.worker,
         use_drm=use_drm_,
-        anchor_ratio=args.anchor_ratio)
+        anchor_ratio=0.0 if args.env == "LifeGate" else args.anchor_ratio)
     t1 = time.time()
     
     print("Training time: {}min".format(round((t1-t0)/60,2)))
