@@ -88,3 +88,34 @@ try:
     gym.register(id="GridNav-v0", entry_point="grid_nav_env:GridNavEnv")
 except Exception:
     pass
+
+
+class DiscreteGridNavWrapper(gym.Wrapper):
+    """Discretises GridNav's 2-D continuous action space into an n×n grid.
+
+    Each discrete action i maps to a (x_target, y_target) pair from an
+    n_bins × n_bins uniform grid over [0, 4]².
+    Grid is row-major: action i → (bins[i // n_bins], bins[i % n_bins]).
+    """
+
+    def __init__(self, env: GridNavEnv, n_bins: int = 5):
+        super().__init__(env)
+        bins = np.linspace(0.0, GridNavEnv.SIZE, n_bins, dtype=np.float32)
+        self._action_map = np.array(
+            [(x, y) for x in bins for y in bins], dtype=np.float32
+        )  # shape (n_bins², 2)
+        self.action_space = gym.spaces.Discrete(len(self._action_map))
+
+    def step(self, action: int):
+        target = self._action_map[int(action)]
+        return self.env.step(target)
+
+
+def _make_discrete_gridnav(n_bins: int = 5) -> DiscreteGridNavWrapper:
+    return DiscreteGridNavWrapper(GridNavEnv(), n_bins=n_bins)
+
+
+try:
+    gym.register(id="GridNav-discrete-v0", entry_point=_make_discrete_gridnav)
+except Exception:
+    pass
