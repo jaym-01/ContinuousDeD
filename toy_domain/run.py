@@ -193,7 +193,12 @@ if __name__ == "__main__":
 
     if args.action_mode == "discrete":
         if args.env == "LifeGate":
-            make_env_fn = lambda: gym.make("LifeGate-v1", state_mode="tabular", rng=np.random.RandomState(), death_drag=0.0)
+            _lifegate_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'LifeGate')
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _lifegate_path)
+                import LifeGate as _lg  # noqa: F401
+                return gym.make("LifeGate-v1", state_mode="tabular", rng=np.random.RandomState(), death_drag=0.0)
         else:
             make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
