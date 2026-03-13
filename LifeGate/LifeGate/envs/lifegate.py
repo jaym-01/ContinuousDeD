@@ -1,6 +1,5 @@
 import os
 from copy import deepcopy
-import pygame
 from gymnasium import Env, spaces
 import numpy as np
 import click
@@ -101,6 +100,8 @@ class LifeGate(Env):
             self._rendering = False
 
     def _init_pygame(self):
+        import pygame
+        self._pygame = pygame
         pygame.init()
         size = [self.rendering_scale * self.scr_w, self.rendering_scale * self.scr_h]
         self.screen = pygame.display.set_mode(size)
@@ -142,6 +143,7 @@ class LifeGate(Env):
     def render(self):
         if not self.rendering:
             return
+        pygame = self._pygame
         pygame.event.pump()
         self.screen.fill(BLACK)
         size = [self.rendering_scale, self.rendering_scale]
@@ -175,13 +177,13 @@ class LifeGate(Env):
 
     def save_image(self):
         if self.rendering and self.render_dir is not None:
-            pygame.image.save(self.screen, self.render_dir + '/render' + str(self.step_id) + '.jpg')
+            self._pygame.image.save(self.screen, self.render_dir + '/render' + str(self.step_id) + '.jpg')
         else:
             raise ValueError('env.rendering is False and/or environment has not been reset.')
     
     def close(self):
         if self.rendering:
-            pygame.quit()
+            self._pygame.quit()
     
     def _move_player(self, action):
         x, y = (self.player_pos_x, self.player_pos_y)
