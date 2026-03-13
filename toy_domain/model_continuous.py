@@ -61,6 +61,10 @@ class ContinuousIQN(nn.Module):
         drm="identity",
         eta=0.71,
         device="cuda:0",
+        state_low=None,
+        state_high=None,
+        action_low=None,
+        action_high=None,
     ):
         super(ContinuousIQN, self).__init__()
         self.seed = torch.manual_seed(seed)
@@ -72,6 +76,30 @@ class ContinuousIQN(nn.Module):
         self.layer_size = layer_size
         self.device = device
         self.drm = self._get_drm(drm, eta)
+
+        # Normalisation: map state and action to ~ [-1, 1]
+        if state_low is not None and state_high is not None:
+            s_low = np.array(state_low, dtype=np.float32)
+            s_high = np.array(state_high, dtype=np.float32)
+            s_mean = (s_high + s_low) / 2.0
+            s_scale = (s_high - s_low) / 2.0
+        else:  # SpaceEnv defaults: (x,y,vx,vy), map 10×10, vel range ±2
+            s_mean = np.array([5.0, 5.0, 0.0, 0.0], dtype=np.float32)
+            s_scale = np.array([5.0, 5.0, 2.0, 2.0], dtype=np.float32)
+
+        if action_low is not None and action_high is not None:
+            a_low = np.array(action_low, dtype=np.float32)
+            a_high = np.array(action_high, dtype=np.float32)
+            a_mean = (a_high + a_low) / 2.0
+            a_scale = (a_high - a_low) / 2.0
+        else:  # SpaceEnv defaults: thrust ∈ [-0.5, 0.5]
+            a_mean = np.zeros(action_dim, dtype=np.float32)
+            a_scale = np.full(action_dim, 0.5, dtype=np.float32)
+
+        self._s_mean = torch.FloatTensor(s_mean)
+        self._s_scale = torch.FloatTensor(s_scale)
+        self._a_mean = torch.FloatTensor(a_mean)
+        self._a_scale = torch.FloatTensor(a_scale)
         # cos basis frequencies: shape (1, 1, n_cos)
         self.pis = torch.FloatTensor(
             [np.pi * i for i in range(1, self.n_cos + 1)]
@@ -95,17 +123,11 @@ class ContinuousIQN(nn.Module):
         cos = torch.cos(taus.to(self.device) * self.pis)  # (batch, n_tau, n_cos)
         return cos, taus.to(self.device)
 
-    # Fixed normalisation constants for SpaceEnv (map 10×10, actions ±0.5)
-    # Brings all inputs to roughly [-1, 1] so no single feature dominates.
-    _S_MEAN  = torch.tensor([5.0,  5.0,  0.0,  0.0])   # (x,y,vx,vy) centres
-    _S_SCALE = torch.tensor([5.0,  5.0,  2.0,  2.0])   # (x,y,vx,vy) half-ranges
-    _A_SCALE = torch.tensor([0.5,  0.5])                # action half-ranges
-
     def _normalise(self, state, action):
         """Normalise (state, action) to ~ [-1, 1] per dimension."""
         dev = state.device
-        s = (state  - self._S_MEAN.to(dev)) / self._S_SCALE.to(dev)
-        a =  action / self._A_SCALE.to(dev)
+        s = (state  - self._s_mean.to(dev))  / self._s_scale.to(dev)
+        a = (action - self._a_mean.to(dev))  / self._a_scale.to(dev)
         return torch.cat([s, a], dim=-1)
 
     def forward(self, state, action, num_tau=8, use_drm=False):

@@ -90,6 +90,8 @@ class ContinuousIQN_Agent:
         seed,
         use_actor=False,
         ALPHA=0.2,
+        state_low=None,
+        state_high=None,
     ):
         self.state_size = state_size
         self.action_dim = action_dim
@@ -116,10 +118,14 @@ class ContinuousIQN_Agent:
         self.qnetwork_local = ContinuousIQN(
             state_size, action_dim, layer_size, seed, N,
             drm=risk_measure, eta=ETA, device=device,
+            state_low=state_low, state_high=state_high,
+            action_low=action_low, action_high=action_high,
         ).to(device)
         self.qnetwork_target = ContinuousIQN(
             state_size, action_dim, layer_size, seed, N,
             drm=risk_measure, eta=ETA, device=device,
+            state_low=state_low, state_high=state_high,
+            action_low=action_low, action_high=action_high,
         ).to(device)
 
         self.optimizer = optim.Adam(self.qnetwork_local.parameters(), lr=LR)
