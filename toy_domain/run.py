@@ -170,6 +170,8 @@ if __name__ == "__main__":
     parser.add_argument("-eps_frames", type=int, default=500000, help="Linear annealed frames for Epsilon, default = 500k")
     parser.add_argument("-dead_end_pct", type=float, default=0.125,
                         help="Fraction [0,1] of total grid area occupied by death+trap zones combined (GridNav only, default = 0.125)")
+    parser.add_argument("-medgrid_scale", type=float, default=1.0,
+                        help="Scale factor for MedGrid danger/recovery zone sizes (MedGrid only, default = 1.0)")
     parser.add_argument("-anchor_ratio", type=float, default=0.3, help="Ratio of episodes that start from anchor states, default = 0.3")
     parser.add_argument("-min_eps", type=float, default = 0.01, help="Final epsilon greedy value, default = 0.01")
     parser.add_argument("-info", type=str, help="Name of the training run")
@@ -180,6 +182,8 @@ if __name__ == "__main__":
 
     if args.dead_end_pct != 0.125 and args.env not in ("GridNav",):
         parser.error("-dead_end_pct is only valid when -env GridNav is selected")
+    if args.medgrid_scale != 1.0 and args.env not in ("MedGrid",):
+        parser.error("-medgrid_scale is only valid when -env MedGrid is selected")
 
     writer = SummaryWriter("runs/"+args.info)       
     seed = args.seed
@@ -218,11 +222,12 @@ if __name__ == "__main__":
                 return gym.make("GridNav-discrete-v0", n_bins=args.n_bins)
         elif args.env == "MedGrid":
             _medgrid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGrid')
+            _medgrid_scale = args.medgrid_scale
             def make_env_fn():
                 import sys as _sys
                 _sys.path.insert(0, _medgrid_path)
                 import med_grid_env  # noqa: F401
-                return gym.make("MedGrid-discrete-v0", n_bins=args.n_bins)
+                return gym.make("MedGrid-discrete-v0", n_bins=args.n_bins, scale=_medgrid_scale)
         else:
             make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
@@ -239,11 +244,12 @@ if __name__ == "__main__":
                 return gym.make("GridNav-v0", dead_end_pct=_dead_end_pct)
         elif args.env == "MedGrid":
             _medgrid_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGrid')
+            _medgrid_scale = args.medgrid_scale
             def make_env_fn():
                 import sys as _sys
                 _sys.path.insert(0, _medgrid_path)
                 import med_grid_env  # noqa: F401
-                return gym.make("MedGrid-v0")
+                return gym.make("MedGrid-v0", scale=_medgrid_scale)
         else:
             make_env_fn = lambda: gym.make("SpaceEnv-flat-v0")
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
