@@ -207,6 +207,13 @@ if __name__ == "__main__":
                 _sys.path.insert(0, _lifegate_path)
                 import LifeGate as _lg  # noqa: F401
                 return gym.make("LifeGate-v1", state_mode="tabular", rng=np.random.RandomState(), death_drag=0.0)
+        elif args.env == "GridNav":
+            _gridnav_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'GridNav')
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _gridnav_path)
+                import grid_nav_env  # noqa: F401
+                return gym.make("GridNav-discrete-v0", n_bins=args.n_bins)
         else:
             make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
