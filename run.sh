@@ -15,4 +15,8 @@
 # .venv/bin/python toy_domain/run.py -env LifeGate -action_mode discrete -agent iqn -ded -frames 10000 -info lifegate_iqn
 
 # GridNav continuous
-.venv/bin/python toy_domain/run.py -env GridNav -action_mode continuous -agent iqn -frames 100000 -info gridnav_iqn -ded -dead_end_pct 0.01
+# .venv/bin/python toy_domain/run.py -env GridNav -action_mode continuous -agent iqn -frames 100000 -info gridnav_iqn -ded -dead_end_pct 0.01
+
+
+
+.venv/bin/python toy_domain/run.py -env MedGrid -action_mode continuous -agent iqn -ded -frames 10 -info medgrid_test_cont
