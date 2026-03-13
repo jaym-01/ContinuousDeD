@@ -9,4 +9,7 @@
 # .venv/bin/python toy_domain/run.py -agent iqn -action_mode discrete -n_bins 17 -ded -frames 500000 -info ded_discrete_17bins
 
 
-.venv/bin/python toy_domain/run.py -action_mode continuous -agent iqn -ded -info continuous_iqn -alpha 0.2 -frames 100000 -anchor_ratio 0.7 -n_step 20
+# .venv/bin/python toy_domain/run.py -action_mode continuous -agent iqn -ded -info continuous_iqn_2 -alpha 0.2 -frames 50000 -anchor_ratio 0.7 -n_step 200
+
+# LifeGate discrete
+.venv/bin/python toy_domain/run.py -env LifeGate -action_mode discrete -agent iqn -ded -frames 10000 -info lifegate_iqn
