@@ -39,8 +39,14 @@ class MedGridEnv(gym.Env):
     _TRAP1_CENTER = np.array([1.5, 1.5], dtype=np.float32)
     _TRAP2_CENTER = np.array([8.5, 8.5], dtype=np.float32)
 
-    def __init__(self):
+    def __init__(self, scale: float = 1.0):
         super().__init__()
+        self._DEATH_RADIUS  = MedGridEnv._DEATH_RADIUS  * scale
+        self._TRAP_RADIUS   = MedGridEnv._TRAP_RADIUS   * scale
+        self._ELLIPSE_A     = MedGridEnv._ELLIPSE_A     * scale
+        self._ELLIPSE_B     = MedGridEnv._ELLIPSE_B     * scale
+        self._TRAP1_CENTER  = np.array([1.5 * scale, 1.5 * scale], dtype=np.float32)
+        self._TRAP2_CENTER  = np.array([10.0 - 1.5 * scale, 10.0 - 1.5 * scale], dtype=np.float32)
         self.observation_space = spaces.Box(
             low=np.zeros(2, dtype=np.float32),
             high=np.full(2, self.SIZE, dtype=np.float32),
@@ -136,8 +142,8 @@ class DiscreteMedGridWrapper(gym.Wrapper):
         return self.env.step(target)
 
 
-def _make_discrete_medgrid(n_bins: int = 5) -> DiscreteMedGridWrapper:
-    return DiscreteMedGridWrapper(MedGridEnv(), n_bins=n_bins)
+def _make_discrete_medgrid(n_bins: int = 5, scale: float = 1.0) -> DiscreteMedGridWrapper:
+    return DiscreteMedGridWrapper(MedGridEnv(scale=scale), n_bins=n_bins)
 
 
 try:
