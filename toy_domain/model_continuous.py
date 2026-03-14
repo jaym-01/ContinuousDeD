@@ -168,6 +168,61 @@ class ContinuousIQN(nn.Module):
         quantiles, _ = self.forward(state, action, self.K, use_drm)
         return quantiles.mean(dim=1)  # (batch, 1)
 
+    def get_qvalue_deterministic(self, state, action):
+        """Deterministic Q(s,a): fixed evenly-spaced τ_k = (k-0.5)/K (no random sampling).
+
+        Identical forward pass to get_qvalue but with taus created once and never
+        resampled, making the output a deterministic function of (state, action).
+        Gradients w.r.t. action flow correctly through this method.
+
+        Returns
+        -------
+        (batch, 1)
+        """
+        batch_size = state.shape[0]
+        K = self.K
+        # Fixed taus: τ_k = (k - 0.5) / K  for k = 1 … K
+        k = torch.arange(1, K + 1, dtype=torch.float32, device=self.device)
+        taus = ((k - 0.5) / K).view(1, K, 1).expand(batch_size, K, 1)  # (batch, K, 1)
+        # Cosine quantile embedding with fixed taus
+        cos = torch.cos(taus * self.pis)                             # (batch, K, n_cos)
+        cos_x = torch.relu(
+            self.cos_embedding(cos.reshape(batch_size * K, self.n_cos))
+        ).view(batch_size, K, self.layer_size)                       # (batch, K, layer_size)
+        # State-action encoding
+        x = torch.relu(self.head(self._normalise(state, action)))    # (batch, layer_size)
+        x = (x.unsqueeze(1) * cos_x).view(batch_size * K, self.layer_size)
+        x = torch.relu(self.ff_1(x))
+        out = self.ff_2(x).view(batch_size, K, 1)                    # (batch, K, 1)
+        return out.mean(dim=1)                                        # (batch, 1)
+
+    def get_cvar_deterministic(self, state, action, alpha=0.2):
+        """CVaR_α Q(s,a) with fixed evenly-spaced quantile points.
+
+        Uses τ_k = (k-0.5)/K for k=1..K (same as get_qvalue_deterministic) but
+        returns the mean of the bottom ⌊α·K⌋ quantile values — i.e. lower CVaR.
+        Fully differentiable w.r.t. action.
+
+        Returns
+        -------
+        (batch, 1)
+        """
+        batch_size = state.shape[0]
+        K = self.K
+        n_keep = max(1, int(alpha * K))
+        k = torch.arange(1, K + 1, dtype=torch.float32, device=self.device)
+        taus = ((k - 0.5) / K).view(1, K, 1).expand(batch_size, K, 1)
+        cos = torch.cos(taus * self.pis)
+        cos_x = torch.relu(
+            self.cos_embedding(cos.reshape(batch_size * K, self.n_cos))
+        ).view(batch_size, K, self.layer_size)
+        x = torch.relu(self.head(self._normalise(state, action)))
+        x = (x.unsqueeze(1) * cos_x).view(batch_size * K, self.layer_size)
+        x = torch.relu(self.ff_1(x))
+        out = self.ff_2(x).view(batch_size, K)              # (batch, K)
+        # Taus are sorted ascending, so first n_keep outputs are the lowest quantiles
+        return out[:, :n_keep].mean(dim=1, keepdim=True)    # (batch, 1)
+
 
 class ContinuousDQN(nn.Module):
     """Plain MLP critic for continuous actions: Q(s,a) → scalar.
