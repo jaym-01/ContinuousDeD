@@ -37,8 +37,11 @@ if __name__ == '__main__':
 
     # Adjust the config based on possible command line inputs... TODO...
 
+    # Ensure output directory exists
+    os.makedirs(config_dict['output_dir'], exist_ok=True)
+
     # Load the data
-    (train_loader, val_loader, test_loader), input_dim, action_dim, static_dim, output_dim = load_data(data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], num_actions=25)
+    (train_loader, val_loader, test_loader), input_dim, action_dim, static_dim, output_dim = load_data(data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'])
 
 
     # Define the training function that will be used by Ax to optimize the hyperparameters
@@ -67,7 +70,7 @@ if __name__ == '__main__':
     best_parameters, values, experiment, model = optimize(
         parameters = config_dict['parameterization'],
         evaluation_function = train_evaluate,
-        objective_name = 'Masked MSE',
+        objective_name = 'Masked_MSE',
         total_trials = config_dict['total_trials'],
         minimize = True,
     )
@@ -80,7 +83,7 @@ if __name__ == '__main__':
     print("Best arm: ", best_arm)
 
     # Create a combined Train/Val dataset!
-    (combined_train_valid_loader, __, test_loader), __, __, __, __ = load_data(data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], num_actions=25, combine_train_val=True, shuffle=True)
+    (combined_train_valid_loader, __, test_loader), __, __, __, __ = load_data(data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], combine_train_val=True, shuffle=True)
 
     ## Re-initialize the model using the best parameters
     ################
