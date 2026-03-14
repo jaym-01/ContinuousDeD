@@ -1,9 +1,9 @@
 ## TODO Document this... Make it look similar to https://github.com/microsoft/med-deadend/blob/main/config_sepsis.yaml
 
 ## The following configuration parameters are for hyperparameter optimization of the Online NCDE state aggregator
-data_dir: "/ais/bulbasaur/twkillian/AHE_Sepsis_Data/rectilinear_processed/"
-output_dir: "/ais/bulbasaur/twkillian/UncDeD_Results/NCDE/"
-total_trials: 50
+data_dir: "data/continuous_mimic/rectilinear_processed/"
+output_dir: "data/continuous_mimic/ncde_output/"
+total_trials: 10
 seed: 2022
 batch_size: 128
 parameterization: [

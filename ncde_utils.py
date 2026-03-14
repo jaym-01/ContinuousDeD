@@ -349,13 +349,11 @@ def load_data(
     mask_data = torch.tensor(npz['masks']).to(torch.int)
     label_data =  None if overlap else torch.tensor(npz['labels']).to(torch.float)
     
-    # Hard coding this ish for now... Baffling weirdness with numpy... (Different floats are read into the same index even from the same data source)
-    if overlap:
-        trajectory_data = pd.read_csv("/ais/bulbasaur/twkillian/AHE_Sepsis_Data/final_trajs_overlapCohort_noFill.csv", compression="gzip")
-    else:
-        trajectory_data = pd.read_csv("/ais/bulbasaur/twkillian/AHE_Sepsis_Data/final_trajs_noFill.csv", compression="gzip")
+    # Load stay IDs from the raw CSV (avoids float32 precision loss when round-tripping through NPZ)
+    parent_dir = os.path.abspath(os.path.join(data_dir, os.pardir))
+    csv_name = "final_trajs_overlapCohort_noFill.csv" if overlap else "final_trajs_noFill.csv"
+    trajectory_data = pd.read_csv(os.path.join(parent_dir, csv_name), compression="gzip")
     stayID_data = torch.from_numpy(trajectory_data['m:stay_id'].unique()).to(torch.float64)
-    # stayID_data = torch.tensor(npz['stay_id']).to(torch.float64)  # Something screwy is happening when loading with numpy right now...
 
 
     # Convert actions to one_hot representation if desired
@@ -364,7 +362,7 @@ def load_data(
 
     # Get dimension information
     static_dim = static_data[0].shape[-1] if use_static else None
-    action_dim = num_actions if one_hot_actions else 1
+    action_dim = num_actions if one_hot_actions else action_data.shape[-1]
     input_dim = temporal_data[0].shape[-1]
     # Output dimension corresponds to the number of continuous features observed in the next time step
     # (we predict the full feature set although we'll only record the loss for those that were actually present)
@@ -478,9 +476,13 @@ def process_all_interpolations(static_data, temporal_data, actions, outcomes, ma
     # Static data has already been preprocessed... 
     processed_data["static_data"] = static_data
 
-    # Temporal interpolation. In `temporal_pipeline()` the interpolation of `temporal_data`, concatenation 
+    # Temporal interpolation. In `temporal_pipeline()` the interpolation of `temporal_data`, concatenation
     # with `intensities``, and padding with zeros to the maximum length sequence is performed
-    processed_data["temporal_data_raw"] = temporal_data
+    # Store raw sequences as a numpy object array (variable-length sequences can't form a regular array)
+    raw_obj = np.empty(len(temporal_data), dtype=object)
+    for i, t in enumerate(temporal_data):
+        raw_obj[i] = t.numpy() if torch.is_tensor(t) else np.array(t)
+    processed_data["temporal_data_raw"] = raw_obj
     processed_data["temporal_data"] = temporal_pipeline(
             temporal_data, intensities, method, return_as_numpy=True
         )
