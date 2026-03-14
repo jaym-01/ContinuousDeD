@@ -29,7 +29,9 @@ import grid_nav_env  # noqa: F401
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGrid'))
 import med_grid_env  # noqa: F401
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'TwoDrug'))
-import env as _twodrug_env  # noqa: F401
+#import _twodrug_env  # noqa: F401
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGridHard'))
+import med_grid_hard_env  # noqa: F401
 
 def evaluate(eps, frame, eval_runs=5):
     """
@@ -173,7 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("-dead_end_pct", type=float, default=0.125,
                         help="Fraction [0,1] of total grid area occupied by death+trap zones combined (GridNav only, default = 0.125)")
     parser.add_argument("-medgrid_scale", type=float, default=1.0,
-                        help="Scale factor for MedGrid danger/recovery zone sizes (MedGrid only, default = 1.0)")
+                        help="Scale factor for MedGrid or MedGridHard danger/recovery zone sizes (MedGrid or MedGridHard only, default = 1.0)")
     parser.add_argument("-anchor_ratio", type=float, default=0.3, help="Ratio of episodes that start from anchor states, default = 0.3")
     parser.add_argument("-min_eps", type=float, default = 0.01, help="Final epsilon greedy value, default = 0.01")
     parser.add_argument("-info", type=str, help="Name of the training run")
@@ -184,8 +186,8 @@ if __name__ == "__main__":
 
     if args.dead_end_pct != 0.125 and args.env not in ("GridNav",):
         parser.error("-dead_end_pct is only valid when -env GridNav is selected")
-    if args.medgrid_scale != 1.0 and args.env not in ("MedGrid",):
-        parser.error("-medgrid_scale is only valid when -env MedGrid is selected")
+    if args.medgrid_scale != 1.0 and args.env not in ("MedGrid", "MedGridHard"):
+        parser.error("-medgrid_scale is only valid when -env MedGrid or -env MedGridHard is selected")
 
     writer = SummaryWriter("runs/"+args.info)       
     seed = args.seed
@@ -243,6 +245,14 @@ if __name__ == "__main__":
                 _sys.path.insert(0, _twodrug_path)
                 import env as _td  # noqa: F401
                 return _td.TwoDrugEnv(discrete_bins=_n_bins)
+        elif args.env == "MedGridHard":
+            _medgridhard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGridHard')
+            _medgridhard_scale = args.medgrid_scale
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _medgridhard_path)
+                import med_grid_hard_env  # noqa: F401
+                return gym.make("MedGridHard-discrete-v0", n_bins=args.n_bins, scale=_medgridhard_scale)
         else:
             make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
@@ -277,6 +287,14 @@ if __name__ == "__main__":
                 _sys.path.insert(0, _twodrug_path)
                 import env as _td  # noqa: F401
                 return _td.TwoDrugEnv()
+        elif args.env == "MedGridHard":
+            _medgridhard_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGridHard')
+            _medgridhard_scale = args.medgrid_scale
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _medgridhard_path)
+                import med_grid_hard_env  # noqa: F401
+                return gym.make("MedGridHard-v0", scale=_medgridhard_scale)
         else:
             make_env_fn = lambda: gym.make("SpaceEnv-flat-v0")
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
@@ -285,7 +303,7 @@ if __name__ == "__main__":
     state_size = eval_env.observation_space.shape
 
     # State normalisation bounds for continuous agents (None = use SpaceEnv defaults)
-    if args.action_mode == "continuous" and args.env in ("GridNav", "MedGrid", "TwoDrug"):
+    if args.action_mode == "continuous" and args.env in ("GridNav", "MedGrid", "TwoDrug", "MedGridHard"):
         _state_low  = eval_env.observation_space.low.tolist()
         _state_high = eval_env.observation_space.high.tolist()
     else:
@@ -340,7 +358,7 @@ if __name__ == "__main__":
         eval_runs=args.eval_runs, 
         worker=args.worker,
         use_drm=use_drm_,
-        anchor_ratio=0.0 if args.env in ("LifeGate", "GridNav", "MedGrid", "TwoDrug") else args.anchor_ratio)
+        anchor_ratio=0.0 if args.env in ("LifeGate", "GridNav", "MedGrid", "TwoDrug", "MedGridHard") else args.anchor_ratio)
     t1 = time.time()
     
     print("Training time: {}min".format(round((t1-t0)/60,2)))
