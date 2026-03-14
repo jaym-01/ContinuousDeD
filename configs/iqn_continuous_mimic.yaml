@@ -1,0 +1,59 @@
+seed: 2022
+model: "ContinuousIQN"
+
+# ------------------------------------------------------------------
+# Continuous action space
+# IV fluid dose and vasopressor dose, already min-max normalised to
+# [0, 1] in the data (fluid ÷ 10,000 mL; vasopressor ÷ 475.2 μg/kg/min)
+# ------------------------------------------------------------------
+action_dim: 2
+action_low:  [0.0, 0.0]
+action_high: [1.0, 1.0]
+
+# ------------------------------------------------------------------
+# Network architecture
+# Wider (128) and slightly deeper (2 layers) than the discrete baseline
+# (64 / 1 layer) because the Q-network now takes state+action as input
+# rather than just state, and outputs a scalar distribution.
+# ------------------------------------------------------------------
+num_q_hidden_units: 128
+num_q_layers: 2
+num_iqn_samples_train: 32   # quantile samples during training (N)
+num_iqn_samples_est: 32     # quantile samples during action selection (K)
+K_actions: 64               # random-shooting candidates for 2-D action space
+drm: "identity"             # distortion risk measure (identity = standard IQN)
+eta: 0.71                   # DRM scaling (unused when drm=identity)
+dueling: False
+noisy_layer: False
+
+# ------------------------------------------------------------------
+# Optimisation
+# ------------------------------------------------------------------
+gamma: 1.0          # undiscounted — required for DeD dead-end signal propagation
+lr: 0.00025
+tau: 0.005          # Polyak averaging coefficient for target network
+q_update_freq: 5    # target network update every N gradient steps
+use_cql: False      # set True to add conservative Q-learning penalty
+cql_weight: 0.5     # CQL penalty weight (only used when use_cql: True)
+
+# ------------------------------------------------------------------
+# Data
+# ------------------------------------------------------------------
+data_dir: "data/continuous_mimic/rectilinear_processed/"
+train_batch_size: 64
+val_batch_size: 128
+num_ps: 0           # positive (survivor) terminal transitions added per minibatch
+num_ns: 2           # negative (death) terminal transitions added per minibatch
+
+# ------------------------------------------------------------------
+# Training loop
+# ------------------------------------------------------------------
+num_epochs: 100
+saving_period: 1    # validate and checkpoint every epoch
+checkpoint_fname: "runs/iqn_continuous_mimic/"
+
+# ------------------------------------------------------------------
+# Misc
+# ------------------------------------------------------------------
+combined: False     # if True, train a single net on both +/- rewards
+smoke_test: False   # if True, use 500 transitions and 2 epochs for a quick sanity check
