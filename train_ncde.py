@@ -23,7 +23,8 @@ if __name__ == '__main__':
 
     # process_interpolate_and_save(new_folder, top_folder)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
 
     # Load the configuration file
     config_dict = yaml.safe_load(open("./configs/ncde_config.yaml", 'r'))

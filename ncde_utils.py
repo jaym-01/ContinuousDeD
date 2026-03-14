@@ -22,7 +22,6 @@ Notes:
 import os, sys
 from pathlib import Path
 import numpy as np
-import pandas as pd
 
 from typing import Dict, List, Optional, Tuple
 
@@ -215,7 +214,7 @@ def evaluator(
             # Loop through the data using the data loader
     loss_pred = 0
     with torch.no_grad():
-        for ii, (inputs, masks, lengths, targets, __) in enumerate(eval_loader):
+        for ii, (inputs, masks, lengths, targets, __, __) in enumerate(eval_loader):
             # print("Batch {}".format(ii),end='')
             static, temporal, actions = inputs
             static = static.to(device)  # 4 dimensional vector (Gender, Age, Height, Weight)
@@ -349,11 +348,7 @@ def load_data(
     mask_data = torch.tensor(npz['masks']).to(torch.int)
     label_data =  None if overlap else torch.tensor(npz['labels']).to(torch.float)
     
-    # Load stay IDs from the raw CSV (avoids float32 precision loss when round-tripping through NPZ)
-    parent_dir = os.path.abspath(os.path.join(data_dir, os.pardir))
-    csv_name = "final_trajs_overlapCohort_noFill.csv" if overlap else "final_trajs_noFill.csv"
-    trajectory_data = pd.read_csv(os.path.join(parent_dir, csv_name), compression="gzip")
-    stayID_data = torch.from_numpy(trajectory_data['m:stay_id'].unique()).to(torch.float64)
+    stayID_data = torch.tensor(npz['stay_id']).to(torch.float64)
 
 
     # Convert actions to one_hot representation if desired
