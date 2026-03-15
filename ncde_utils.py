@@ -30,7 +30,10 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader
 
-from sklearn.base import TransformerMixin
+class TransformerMixin:
+    """Minimal sklearn TransformerMixin replacement — provides fit_transform only."""
+    def fit_transform(self, X, y=None, **fit_params):
+        return self.fit(X, y, **fit_params).transform(X)
 from torchcde import linear_interpolation_coeffs, natural_cubic_coeffs
 
 
