@@ -35,10 +35,19 @@ class TransformerMixin:
     def fit_transform(self, X, y=None, **fit_params):
         return self.fit(X, y, **fit_params).transform(X)
 
-# Import directly from submodules to avoid torchcde/__init__.py → solver.py →
-# torchdiffeq → scipy.integrate chain (scipy can be broken on some environments)
-from torchcde.interpolation_linear import linear_interpolation_coeffs
-from torchcde.interpolation_cubic import natural_cubic_coeffs
+# torchdiffeq / torchsde are only needed for torchcde's ODE solver (cdeint).
+# We only use the interpolation functions, so mock these two packages before
+# torchcde/__init__.py tries to import them.  This prevents the
+# torchdiffeq → scipy.integrate → broken-numpy chain on environments where
+# scipy and numpy versions are mismatched (e.g. Colab).
+# If they are already properly loaded (healthy scipy), the mocks are skipped.
+import sys as _sys
+if 'torchdiffeq' not in _sys.modules:
+    from unittest.mock import MagicMock as _MM
+    _sys.modules['torchdiffeq'] = _MM()
+    _sys.modules['torchsde']    = _MM()
+
+from torchcde import linear_interpolation_coeffs, natural_cubic_coeffs
 
 
 # sys.path.append("../")
