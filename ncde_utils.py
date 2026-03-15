@@ -34,7 +34,11 @@ class TransformerMixin:
     """Minimal sklearn TransformerMixin replacement — provides fit_transform only."""
     def fit_transform(self, X, y=None, **fit_params):
         return self.fit(X, y, **fit_params).transform(X)
-from torchcde import linear_interpolation_coeffs, natural_cubic_coeffs
+
+# Import directly from submodules to avoid torchcde/__init__.py → solver.py →
+# torchdiffeq → scipy.integrate chain (scipy can be broken on some environments)
+from torchcde.interpolation_linear import linear_interpolation_coeffs
+from torchcde.interpolation_cubic import natural_cubic_coeffs
 
 
 # sys.path.append("../")
