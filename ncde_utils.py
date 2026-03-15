@@ -30,23 +30,7 @@ from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset, DataLoader
 
-class TransformerMixin:
-    """Minimal sklearn TransformerMixin replacement — provides fit_transform only."""
-    def fit_transform(self, X, y=None, **fit_params):
-        return self.fit(X, y, **fit_params).transform(X)
-
-# torchdiffeq / torchsde are only needed for torchcde's ODE solver (cdeint).
-# We only use the interpolation functions, so mock these two packages before
-# torchcde/__init__.py tries to import them.  This prevents the
-# torchdiffeq → scipy.integrate → broken-numpy chain on environments where
-# scipy and numpy versions are mismatched (e.g. Colab).
-# If they are already properly loaded (healthy scipy), the mocks are skipped.
-import sys as _sys
-if 'torchdiffeq' not in _sys.modules:
-    from unittest.mock import MagicMock as _MM
-    _sys.modules['torchdiffeq'] = _MM()
-    _sys.modules['torchsde']    = _MM()
-
+from sklearn.base import TransformerMixin
 from torchcde import linear_interpolation_coeffs, natural_cubic_coeffs
 
 
