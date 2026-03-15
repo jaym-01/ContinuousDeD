@@ -8,12 +8,12 @@ class TrapGridEnv(gym.Env):
 
     State:  (x, y) ∈ [0, 10]²
     Action: (x_target, y_target) ∈ [0, 10]² — desired next position (direct teleport).
-    Start:  (9.9, 0.1) — bottom-right corner.
+    Start:  (10, 0) — bottom-right corner.
 
     Zones (evaluated on s_{t+1}):
         Recovery Zone (Blue):  (x-5)²+(y-5)² ≤ 0.0625  (r=0.25)  → r=+1, terminated=True
         Trap Zone     (Yellow): 0.0625 < (x-5)²+(y-5)² ≤ 1.0       → r=0,  terminated=False
-        Neutral Zone  (White): x ∈ [9.8,10], y ∈ [0,0.2]           → r=0,  terminated=False
+        Neutral Zone  (White): x ∈ [9.0,10], y ∈ [0,1]             → r=0,  terminated=False
         Death Zone    (Red):   everywhere else                        → r=-1, terminated=True
 
     Trap mechanics:
@@ -21,7 +21,7 @@ class TrapGridEnv(gym.Env):
     """
 
     SIZE = 10.0
-    START = np.array([9.9, 0.1], dtype=np.float32)
+    START = np.array([10.0, 0.0], dtype=np.float32)
     MAX_STEPS = 200
 
     _RECOVERY_CENTER = np.array([5.0, 5.0], dtype=np.float32)
@@ -29,11 +29,11 @@ class TrapGridEnv(gym.Env):
     _TRAP_OUTER_RADIUS = 1.0
     _TRAP_FORCED_STATE = np.array([2.0, 2.0], dtype=np.float32)
 
-    # Neutral (start) zone bounds
-    _NEUTRAL_X_MIN = 9.8
+    # Neutral (start) zone bounds — 1×1 square in the bottom-right corner
+    _NEUTRAL_X_MIN = 9.0
     _NEUTRAL_X_MAX = 10.0
     _NEUTRAL_Y_MIN = 0.0
-    _NEUTRAL_Y_MAX = 0.2
+    _NEUTRAL_Y_MAX = 1.0
 
     def __init__(self, scale: float = 1.0):
         super().__init__()
