@@ -18,8 +18,8 @@ action_high: [1.0, 1.0]
 # ------------------------------------------------------------------
 num_q_hidden_units: 128
 num_q_layers: 2
-num_iqn_samples_train: 32   # quantile samples during training (N)
-num_iqn_samples_est: 32     # quantile samples during action selection (K)
+num_iqn_samples_train: 64   # quantile samples during training (N) — matches paper
+num_iqn_samples_est: 64     # quantile samples during action selection (K)
 K_actions: 64               # random-shooting candidates for 2-D action space
 drm: "identity"             # distortion risk measure (identity = standard IQN)
 eta: 0.71                   # DRM scaling (unused when drm=identity)
@@ -30,25 +30,25 @@ noisy_layer: False
 # Optimisation
 # ------------------------------------------------------------------
 gamma: 1.0          # undiscounted — required for DeD dead-end signal propagation
-lr: 0.00025
+lr: 0.00002         # 2e-5 — matches paper; must be low when CQL is active
 tau: 0.005          # Polyak averaging coefficient for target network
 q_update_freq: 5    # target network update every N gradient steps
-use_cql: False      # set True to add conservative Q-learning penalty
-cql_weight: 0.5     # CQL penalty weight (only used when use_cql: True)
+use_cql: True       # paper always uses CQL
+cql_weight: 0.035   # paper β=0.035; paper Fig.10 shows β>0.2 causes collapse
 
 # ------------------------------------------------------------------
 # Data
 # ------------------------------------------------------------------
 data_dir: "data/continuous_mimic/rectilinear_processed/"
-train_batch_size: 64
+train_batch_size: 256
 val_batch_size: 128
-num_ps: 0           # positive (survivor) terminal transitions added per minibatch
-num_ns: 2           # negative (death) terminal transitions added per minibatch
+num_ps: 2           # positive (survivor) terminal transitions added per minibatch
+num_ns: 4           # negative (death) terminal transitions added per minibatch
 
 # ------------------------------------------------------------------
 # Training loop
 # ------------------------------------------------------------------
-num_epochs: 100
+num_epochs: 75
 saving_period: 1    # validate and checkpoint every epoch
 checkpoint_fname: "runs/iqn_continuous_mimic/"
 
