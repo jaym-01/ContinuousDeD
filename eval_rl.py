@@ -13,9 +13,10 @@ import matplotlib.pyplot as plt
 
 import torch
 
-from rl_utils import RLDataLoader, DQN_Agent, IQN_Agent, create_analysis_df
+from rl_utils import RLDataLoader, DQN_Agent, IQN_Agent, create_analysis_df, ContinuousIQN_OfflineAgent
 from plot_utils import plot_value_hists
 from analysis_utils import get_dn_rn_info, create_analysis_df
+from boundary_tracing import dead_end_volume_fraction
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
@@ -30,20 +31,73 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def load_best_rl(params, sided_Q, device):
     best_rl_path = os.path.join(params['checkpoint_fname'], f"best_q_parameters{sided_Q}.pt")
     best_rl_checkpoint = torch.load(best_rl_path)
-    
+
     # Initialize the model
     if params['model'] == 'DQN':
         model = DQN_Agent(params['input_dim'], params, sided_Q=sided_Q, device=device)
     elif params['model'] == 'IQN':
         model = IQN_Agent(params['input_dim'], params, sided_Q=sided_Q, device=device)
+    elif params['model'] == 'ContinuousIQN':
+        model = ContinuousIQN_OfflineAgent(params['input_dim'], params, sided_Q=sided_Q, device=device)
     else:
-        raise NotImplementedError('The provided model type has not yet been defined, please use DQN or IQN')
+        raise NotImplementedError('The provided model type has not yet been defined, please use DQN, IQN, or ContinuousIQN')
 
     # Load the best performing parameters (based on validation loss) into the model
     model.network.load_state_dict(best_rl_checkpoint['rl_network_state_dict'])
     model.eval()
     print(f"{sided_Q.capitalize()} Q-Network loaded")
     return model
+
+
+def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
+                                  bnd_M=10, bnd_alpha=0.1, bnd_delta_D=-0.5):
+    """Compute dead-end volume fraction f_D per state using boundary tracing.
+
+    v_dn = -f_D  (range [-1, 0]) and v_rn = 1 - f_D  (range [0, 1]) are stored
+    so that compare_flag_range flags a state at threshold thr when f_D > 1 - thr.
+    At the canonical thr=0.5 this correctly flags states with f_D > 0.5.
+    """
+    n_total = len(encoded_data['states'])
+    action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
+    action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
+
+    rows = []
+    print(f"Computing dead-end volume fractions via boundary tracing (M={bnd_M}, alpha={bnd_alpha})...")
+    for traj in range(n_total):
+        traj_len = int(encoded_data['lengths'][traj][0])
+        traj_r   = encoded_data['rewards'][traj][:traj_len]
+        terminal_r = float(traj_r[-1].flatten()[0])
+        if terminal_r not in (-1.0, 1.0):
+            continue
+        category = -1 if terminal_r < 0 else 1
+        traj_sid = encoded_data['stay_ids'][traj]
+        traj_a   = encoded_data['actions'][traj][:traj_len]
+
+        for t in range(traj_len):
+            state = encoded_data['states'][traj][t]
+            f_D, _ = dead_end_volume_fraction(
+                state, qnet_dn,
+                delta_D=bnd_delta_D,
+                alpha=bnd_alpha,
+                M=bnd_M,
+                action_low=action_low,
+                action_high=action_high,
+            )
+            rows.append({
+                'traj':     traj,
+                'step':     t,
+                's':        state,
+                'a':        traj_a[t],
+                'f_D':      f_D,
+                'v_dn':     -f_D,        # flags when v_dn < (thr - 1), i.e. f_D > 1 - thr
+                'v_rn':     1.0 - f_D,   # flags when v_rn < thr, i.e. f_D > 1 - thr
+                'category': category,
+                'stay_id':  traj_sid,
+            })
+        if (traj + 1) % 50 == 0:
+            print(f"  {traj + 1}/{n_total} trajectories processed")
+
+    return pd.DataFrame(rows)
 
 #############################
 ##     MAIN EXECUTOR
@@ -93,14 +147,27 @@ def run(config, options, data, plot_hists):
     params["input_dim"] = encoded_data['states'].shape[-1]
 
     print("Loading best Q-Networks and making Q-values ...")
-    
+
     # Initialize and load the trained models
     qnet_dn = load_best_rl(params, "negative", device)
     qnet_rn = load_best_rl(params, "positive", device)
 
-    # Retrieve the Q-values for each state (for all actions)
-    distributional = params['model'] == "IQN"
-    data = get_dn_rn_info(qnet_dn, qnet_rn, encoded_data, device, distributional=distributional)
+    continuous = params['model'] == 'ContinuousIQN'
+    distributional = False  # overridden below for discrete IQN
+
+    if continuous:
+        # Continuous action space: classify each state via dead-end volume fraction
+        data = get_continuous_dead_end_data(
+            qnet_dn, encoded_data, device, params,
+            bnd_M=params.get('bnd_M', 10),
+            bnd_alpha=params.get('bnd_alpha', 0.1),
+            bnd_delta_D=params.get('bnd_delta_D', -0.5),
+        )
+    else:
+        # Discrete action space: retrieve Q-values for each state (for all actions)
+        distributional = params['model'] == "IQN"
+        data = get_dn_rn_info(qnet_dn, qnet_rn, encoded_data, device, distributional=distributional)
+        data = pd.DataFrame(data)
 
     with open(os.path.join(params['checkpoint_fname'], "value_data"+addon+".pkl"), "wb") as f:
         pickle.dump(data, f)
@@ -120,52 +187,53 @@ def run(config, options, data, plot_hists):
             traj_type = "survivors"
             print("+++++++++++ Survivors")
 
-        dn_q_traj = []
-        rn_q_traj = []
         dn_q_selected_action_traj = []
         rn_q_selected_action_traj = []
-        dn_q_CVaR_traj = []
-        rn_q_CVaR_traj = []
-        sid_traj = []  # Keep track of the specific stay IDs associated with each patient trajectory (for analysis purposes)
+        dn_v_median_traj = []
+        rn_v_median_traj = []
+        sid_traj = []
         for traj in trajectories:
             d = data[data.traj == traj]
-            sid_traj.append(d.stay_id.tolist()[0])  # We only need one Stay ID per trajectory (was repeated across time for each trajectory in this column)
-            dn_q_traj.append(np.array(d.q_dn.tolist(), dtype=np.float32))
-            rn_q_traj.append(np.array(d.q_rn.tolist(), dtype=np.float32))
-            if not distributional:
-                dn_q_selected_action = [d.q_dn.tolist()[t][d.a.tolist()[t]] for t in range(d.q_dn.shape[0])] 
-                rn_q_selected_action = [d.q_rn.tolist()[t][d.a.tolist()[t]] for t in range(d.q_rn.shape[0])] 
+            sid_traj.append(d.stay_id.tolist()[0])
+
+            if continuous:
+                # v_dn = -f_D, v_rn = 1 - f_D; shape (T,) per trajectory
+                f_D_traj = d.f_D.values.astype(np.float32)      # (T,)
+                dn_q_selected_action_traj.append(-f_D_traj)
+                rn_q_selected_action_traj.append(1.0 - f_D_traj)
+                dn_v_median_traj.append(-f_D_traj)
+                rn_v_median_traj.append(1.0 - f_D_traj)
             else:
-                (num_steps, num_samples, num_actions) = dn_q_traj[-1].shape
-                cvar_dn_traj = np.zeros((num_steps, len(VaR_thresholds), num_actions))
-                cvar_rn_traj = np.zeros((num_steps, len(VaR_thresholds), num_actions))
-                # Loop through all VaR thresholds and the extract the selected action
-                for i, var in enumerate(VaR_thresholds):
-                    var_cutoff = round(var*num_samples)
-                    cvar_dn_traj[:, i, :] = np.mean(dn_q_traj[-1][:, :var_cutoff, :], axis=1)
-                    cvar_rn_traj[:, i, :] = np.mean(rn_q_traj[-1][:, :var_cutoff, :], axis=1)
+                dn_q_traj = np.array(d.q_dn.tolist(), dtype=np.float32)
+                rn_q_traj = np.array(d.q_rn.tolist(), dtype=np.float32)
+                if not distributional:
+                    dn_q_selected_action = [d.q_dn.tolist()[t][d.a.tolist()[t]] for t in range(d.q_dn.shape[0])]
+                    rn_q_selected_action = [d.q_rn.tolist()[t][d.a.tolist()[t]] for t in range(d.q_rn.shape[0])]
+                    dn_q_selected_action_traj.append(dn_q_selected_action)
+                    rn_q_selected_action_traj.append(rn_q_selected_action)
+                    dn_v_median_traj.append(np.median(dn_q_traj, axis=1))
+                    rn_v_median_traj.append(np.median(rn_q_traj, axis=1))
+                else:
+                    (num_steps, num_samples, num_actions) = dn_q_traj.shape
+                    cvar_dn_traj = np.zeros((num_steps, len(VaR_thresholds), num_actions))
+                    cvar_rn_traj = np.zeros((num_steps, len(VaR_thresholds), num_actions))
+                    for ii, var in enumerate(VaR_thresholds):
+                        var_cutoff = round(var * num_samples)
+                        cvar_dn_traj[:, ii, :] = np.mean(dn_q_traj[:, :var_cutoff, :], axis=1)
+                        cvar_rn_traj[:, ii, :] = np.mean(rn_q_traj[:, :var_cutoff, :], axis=1)
 
-                # Select the CVaR values for only the actions that were actually used
-                dn_q_selected_action = torch.from_numpy(cvar_dn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, 20, 1)).squeeze().numpy()
-                rn_q_selected_action = torch.from_numpy(cvar_rn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, 20, 1)).squeeze().numpy()
-
-                # Record the CVaR values for all VaR thresholds (for computing the median across actions)
-                dn_q_CVaR_traj.append(cvar_dn_traj)
-                rn_q_CVaR_traj.append(cvar_rn_traj)
-                
-            dn_q_selected_action_traj.append(dn_q_selected_action)
-            rn_q_selected_action_traj.append(rn_q_selected_action)
-        
+                    dn_q_selected_action = torch.from_numpy(cvar_dn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, 20, 1)).squeeze().numpy()
+                    rn_q_selected_action = torch.from_numpy(cvar_rn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, 20, 1)).squeeze().numpy()
+                    dn_q_selected_action_traj.append(dn_q_selected_action)
+                    rn_q_selected_action_traj.append(rn_q_selected_action)
+                    dn_v_median_traj.append(np.median(cvar_dn_traj, axis=2))
+                    rn_v_median_traj.append(np.median(cvar_rn_traj, axis=2))
 
         results[traj_type]["dn_q_selected_action_traj"] = dn_q_selected_action_traj
         results[traj_type]["rn_q_selected_action_traj"] = rn_q_selected_action_traj
         results[traj_type]["stay_ids"] = sid_traj
-        if not distributional:
-            results[traj_type]["dn_v_median_traj"] = [np.median(q, axis=1) for q in dn_q_traj]
-            results[traj_type]["rn_v_median_traj"] = [np.median(q, axis=1) for q in rn_q_traj]
-        else:
-            results[traj_type]["dn_v_median_traj"] = [np.median(q, axis=2) for q in dn_q_CVaR_traj]
-            results[traj_type]["rn_v_median_traj"] = [np.median(q, axis=2) for q in rn_q_CVaR_traj]
+        results[traj_type]["dn_v_median_traj"] = dn_v_median_traj
+        results[traj_type]["rn_v_median_traj"] = rn_v_median_traj
 
     with open(os.path.join(params['checkpoint_fname'], "pre_flag_results"+addon+".pkl"), "wb") as f:
         pickle.dump(results, f)
@@ -180,10 +248,10 @@ def run(config, options, data, plot_hists):
 
         # Create arrays of additional subsampling of the computed values
         # This accounts for the extra outer loop needed to analyze the distributional RL results
-        if distributional: 
-            VaR_thresholds =  np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
-        else:
+        if continuous or not distributional:
             VaR_thresholds = [None]
+        else:
+            VaR_thresholds =  np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
 
         time_steps = [-72, -48, -24, -12, -8, -4, -1]  # The hours before the terminal observation that we want to construct histograms for
 

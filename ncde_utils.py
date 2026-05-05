@@ -327,10 +327,11 @@ class Interpolation(TransformerMixin):
 ############################################
 
 def load_data(
-    data_dir="/ais/bulbasaur/twkillian/AHE_Sepsis_Data/rectilinear_processed/", 
-    use_static=True, overlap=False, 
-    batch_size=None, one_hot_actions=False, 
+    data_dir="/ais/bulbasaur/twkillian/AHE_Sepsis_Data/rectilinear_processed/",
+    use_static=True, overlap=False,
+    batch_size=None, one_hot_actions=False,
     num_actions=None,
+    n_action_bins=None,
     combine_train_val=False,
     shuffle=False
     ):
@@ -347,17 +348,28 @@ def load_data(
     length_data = torch.tensor(npz['lengths']).to(torch.float)
     mask_data = torch.tensor(npz['masks']).to(torch.int)
     label_data =  None if overlap else torch.tensor(npz['labels']).to(torch.float)
-    
+
     stayID_data = torch.tensor(npz['stay_id']).to(torch.float64)
 
+    # Discretize continuous actions into quantile bins then one-hot encode jointly
+    if n_action_bins is not None:
+        N, T, A = action_data.shape
+        flat = action_data.numpy().reshape(-1, A)  # (N*T, A)
+        bin_indices = np.zeros((N * T, A), dtype=np.int64)
+        for i in range(A):
+            edges = np.percentile(flat[:, i], np.linspace(0, 100, n_action_bins + 1))
+            bin_indices[:, i] = np.minimum(
+                np.digitize(flat[:, i], edges[1:-1]), n_action_bins - 1
+            )
+        joint_idx = bin_indices[:, 0] * n_action_bins + bin_indices[:, 1]  # 0 … n_action_bins²-1
+        joint_idx = torch.tensor(joint_idx.reshape(N, T), dtype=torch.long)
+        n_joint = n_action_bins ** 2
+        action_data = torch.nn.functional.one_hot(joint_idx, num_classes=n_joint).float()  # (N, T, n_joint)
+        action_dim = n_joint
+    else:
+        action_dim = action_data.shape[-1]
 
-    # Convert actions to one_hot representation if desired
-    if one_hot_actions:
-        action_data = torch.nn.functional.one_hot(action_data, num_classes=num_actions)
-
-    # Get dimension information
     static_dim = static_data[0].shape[-1] if use_static else None
-    action_dim = num_actions if one_hot_actions else action_data.shape[-1]
     input_dim = temporal_data[0].shape[-1]
     # Output dimension corresponds to the number of continuous features observed in the next time step
     # (we predict the full feature set although we'll only record the loss for those that were actually present)

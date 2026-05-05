@@ -2,6 +2,7 @@
 Encode all the data using the best performing NCDE model.
 """
 import os, sys, time
+import argparse
 import yaml
 import random
 import numpy as np
@@ -13,10 +14,20 @@ from ncde import NeuralCDE
 
 if __name__ == '__main__':
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config', default='ncde_config', help='Config name (without .yaml) in ./configs/')
+    args = parser.parse_args()
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Device: {device}")
+
     # Load the configuration file
-    config_dict = yaml.safe_load(open("./configs/ncde_config.yaml", 'r'))
+    config_dict = yaml.safe_load(open(f"./configs/{args.config}.yaml", 'r'))
 
     # Set the random seeds
     torch.manual_seed(config_dict['seed'])
@@ -24,10 +35,21 @@ if __name__ == '__main__':
     if device == "cuda":
         torch.cuda.manual_seed(config_dict['seed'])
 
+    action_kwargs = {
+        'one_hot_actions': config_dict.get('one_hot_actions', False),
+        'n_action_bins':   config_dict.get('n_action_bins', None),
+    }
+    encode_output_dir = config_dict.get('encode_output_dir', config_dict['data_dir'])
+    os.makedirs(encode_output_dir, exist_ok=True)
+
     # Load the data (both the nominal and overlapping data)
     dl_types = ("train", "validation", "test")
-    dataloaders, input_dim, action_dim, static_dim, output_dim = load_data(data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], num_actions=25)
-    (overlap_dataloader, __, __), _, _, _, _ = load_data(data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], overlap=True, num_actions=25)
+    dataloaders, input_dim, action_dim, static_dim, output_dim = load_data(
+        data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], **action_kwargs
+    )
+    (overlap_dataloader, __, __), _, _, _, _ = load_data(
+        data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], overlap=True, **action_kwargs
+    )
 
     # Load the best performing NCDE hyperparameters and pre-trained model weights
     ncde_params = torch.load(os.path.join(config_dict['output_dir'], 'best_model.pt'))
@@ -83,7 +105,7 @@ if __name__ == '__main__':
 
             # Save off an npz file for this part of the dataset
             np.savez(
-                os.path.join(config_dict['data_dir'], "encoded_{}.npz".format(dataset)),
+                os.path.join(encode_output_dir, "encoded_{}.npz".format(dataset)),
                 states=encoded,
                 actions=actions,
                 rewards=rewards,
@@ -123,7 +145,7 @@ if __name__ == '__main__':
 
         # Save off an npz file for this part of the dataset
         np.savez(
-            os.path.join(config_dict['data_dir'], "encoded_overlap.npz"),
+            os.path.join(encode_output_dir, "encoded_overlap.npz"),
             states=encoded,
             actions=actions,
             rewards=rewards,

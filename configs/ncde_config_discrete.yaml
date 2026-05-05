@@ -1,0 +1,20 @@
+data_dir: "data/continuous_mimic/rectilinear_processed/"
+output_dir: "data/continuous_mimic/ncde_output_discrete/"
+encode_output_dir: "data/continuous_mimic/rectilinear_processed_discrete/"
+total_trials: 10
+seed: 2022
+batch_size: 128
+
+# Actions discretized into 5 quantile bins per axis, joint one-hot encoded (action_dim=25)
+one_hot_actions: false
+n_action_bins: 5
+
+parameterization: [
+        {"name": "hidden_dim", "type": "range", "bounds": [32, 128]},
+        {"name": "hidden_hidden_dim", "type": "range", "bounds": [32, 128]},
+        {"name": "pred_num_layers", "type": "range", "bounds": [1, 4]},
+        {"name": "pred_num_units", "type": "range", "bounds": [32, 128]},
+        {"name": "lr", "type": "fixed", "value": 0.0005},
+        {"name": "lr_step_size", "type": "range", "bounds": [10, 30]},
+        {"name": "lr_gamma", "type": "choice", "values": [0.1, 0.5, 0.9, 1.0], "is_ordered": true},
+        {"name": "num_training_epochs", "type": "choice", "values": [10, 25, 50]},]
