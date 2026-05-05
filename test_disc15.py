@@ -182,7 +182,7 @@ def run_experiment():
             axes[1].set_title(f'Q_r CVaR (alpha={ALPHA})')
             
             # Add one colorbar that serves for both plots
-            fig.colorbar(im_d, ax= axes[1], fraction=0.046, pad=0.04))
+            fig.colorbar(im_d, ax= axes[1], fraction=0.046, pad=0.04)
 
 
             """
