@@ -19,4 +19,6 @@
 
 
 
-.venv/bin/python toy_domain/run.py -env MedGrid -action_mode continuous -agent iqn -ded -frames 10 -info medgrid_test_cont medgrid_scale 0.5
+# .venv/bin/python toy_domain/run.py -env MedGrid -action_mode continuous -agent iqn -ded -frames 10 -info medgrid_test_cont medgrid_scale 0.5
+
+python3 PredictorCorrectorExplainer.py
