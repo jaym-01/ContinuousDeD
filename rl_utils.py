@@ -345,7 +345,7 @@ class DQN_Agent(nn.Module):
         self.update_freq = params.get("q_update_freq", 25)
 
         # Set up the optimizer
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr, amsgrad=True)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr, amsgrad=True, weight_decay=1e-4)
 
     def _train_on_batch(self, s, a, r, s2, t):
         """With the provided batch of data, run a training Bellman update."""
@@ -679,7 +679,7 @@ class IQN_Agent(nn.Module):
         self.update_counter = 0
         self.update_freq = params.get("q_update_freq", 25)
 
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr, weight_decay=1e-4)
         print(self.network)
 
         self.t_step = 0
@@ -1008,7 +1008,7 @@ class ContinuousIQN_OfflineAgent(nn.Module):
         self.target_network.load_state_dict(self.network.state_dict())
 
         self.optimizer      = optim.Adam(
-            self.network.parameters(), lr=params.get('lr', 2.5e-4)
+            self.network.parameters(), lr=params.get('lr', 2.5e-4), weight_decay=1e-4
         )
         self.update_counter = 0
         self.update_freq    = params.get('q_update_freq', 5)
