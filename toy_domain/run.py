@@ -20,7 +20,7 @@ ANCHOR_STATES = [
 ]
 
 # Register "SpaceEnv-discrete-v0" by importing the SpaceEnv module
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'SpaceEnv'))
+"""sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'SpaceEnv'))
 import space_env  # noqa: F401
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'LifeGate'))
 import LifeGate as _lifegate  # noqa: F401
@@ -33,7 +33,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGridHard'))
 import med_grid_hard_env  # noqa: F401
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'TrapGrid'))
-import trap_grid_env  # noqa: F401
+import trap_grid_env  # noqa: F401"""
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGridGeneral'))
+import med_grid_general_env  # noqa: F401
 
 def evaluate(eps, frame, eval_runs=5):
     """
@@ -183,12 +185,13 @@ if __name__ == "__main__":
     parser.add_argument("-info", type=str, help="Name of the training run")
     parser.add_argument("-save_model", type=int, choices=[0,1], default=1, help="Specify if the trained network shall be saved or not, default is 1 - save model!")
     parser.add_argument("-w", "--worker", type=int, default=1, help="Number of parallel Environments. Batch size increases proportional to number of worker. not recommended to have more than 4 worker, default = 1")
+    parser.add_argument("-num_dead_ends", type=int, default=2, help="Number of dead-ends to generate in the environment")
 
     args = parser.parse_args()
 
     if args.dead_end_pct != 0.125 and args.env not in ("GridNav",):
         parser.error("-dead_end_pct is only valid when -env GridNav is selected")
-    if args.medgrid_scale != 1.0 and args.env not in ("MedGrid", "MedGridHard", "TrapGrid"):
+    if args.medgrid_scale != 1.0 and args.env not in ("MedGrid", "MedGridHard", "MedGridGeneral", "TrapGrid"):
         parser.error("-medgrid_scale is only valid when -env MedGrid, -env MedGridHard, or -env TrapGrid is selected")
 
     writer = SummaryWriter("runs/"+args.info)       
@@ -203,7 +206,7 @@ if __name__ == "__main__":
     LR = args.lr
     n_step = args.n_step
     env_name = args.env
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 
     print("Using ", device)
 
@@ -263,6 +266,14 @@ if __name__ == "__main__":
                 _sys.path.insert(0, _trapgrid_path)
                 import trap_grid_env  # noqa: F401
                 return gym.make("TrapGrid-discrete-v0", n_bins=args.n_bins, scale=_trapgrid_scale)
+        elif args.env == "MedGridGeneral":
+            _medgridgeneral_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGridGeneral')
+            _medgridgeneral_scale = args.medgrid_scale
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _medgridgeneral_path)
+                import med_grid_general_env  # noqa: F401
+                return gym.make("MedGridGeneral-discrete-v0", n_bins=args.n_bins, scale=_medgridgeneral_scale, num_dead_ends=args.num_dead_ends)
         else:
             make_env_fn = lambda: gym.make(args.env, n_bins=args.n_bins)
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
@@ -313,6 +324,14 @@ if __name__ == "__main__":
                 _sys.path.insert(0, _trapgrid_path)
                 import trap_grid_env  # noqa: F401
                 return gym.make("TrapGrid-v0", scale=_trapgrid_scale)
+        elif args.env == "MedGridGeneral":
+            _medgridgeneral_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'MedGridGeneral')
+            _medgridgeneral_scale = args.medgrid_scale
+            def make_env_fn():
+                import sys as _sys
+                _sys.path.insert(0, _medgridgeneral_path)
+                import med_grid_general_env  # noqa: F401
+                return gym.make("MedGridGeneral-v0", scale=_medgridgeneral_scale, num_dead_ends=args.num_dead_ends)
         else:
             make_env_fn = lambda: gym.make("SpaceEnv-flat-v0")
         envs = MultiPro.SubprocVecEnv([make_env_fn for _ in range(args.worker)])
@@ -321,7 +340,7 @@ if __name__ == "__main__":
     state_size = eval_env.observation_space.shape
 
     # State normalisation bounds for continuous agents (None = use SpaceEnv defaults)
-    if args.action_mode == "continuous" and args.env in ("GridNav", "MedGrid", "TwoDrug", "MedGridHard", "TrapGrid"):
+    if args.action_mode == "continuous" and args.env in ("GridNav", "MedGrid", "TwoDrug", "MedGridHard", "TrapGrid", "MedGridGeneral"):
         _state_low  = eval_env.observation_space.low.tolist()
         _state_high = eval_env.observation_space.high.tolist()
     else:
@@ -376,7 +395,7 @@ if __name__ == "__main__":
         eval_runs=args.eval_runs, 
         worker=args.worker,
         use_drm=use_drm_,
-        anchor_ratio=0.0 if args.env in ("LifeGate", "GridNav", "MedGrid", "TwoDrug", "MedGridHard", "TrapGrid") else args.anchor_ratio)
+        anchor_ratio=0.0 if args.env in ("LifeGate", "GridNav", "MedGrid", "TwoDrug", "MedGridHard", "TrapGrid", "MedGridGeneral") else args.anchor_ratio)
     t1 = time.time()
     
     print("Training time: {}min".format(round((t1-t0)/60,2)))
