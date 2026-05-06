@@ -32,6 +32,11 @@ def load_best_rl(params, sided_Q, device):
     best_rl_path = os.path.join(params['checkpoint_fname'], f"best_q_parameters{sided_Q}.pt")
     best_rl_checkpoint = torch.load(best_rl_path, map_location=device, weights_only=False)
 
+    # Align model input size with checkpoint to avoid silent shape mismatches.
+    if 'rl_network_state_dict' in best_rl_checkpoint and 'head.weight' in best_rl_checkpoint['rl_network_state_dict']:
+        ckpt_in_dim = best_rl_checkpoint['rl_network_state_dict']['head.weight'].shape[1]
+        params['input_dim'] = int(ckpt_in_dim)
+
     # Initialize the model
     if params['model'] == 'DQN':
         model = DQN_Agent(params['input_dim'], params, sided_Q=sided_Q, device=device)
@@ -47,6 +52,14 @@ def load_best_rl(params, sided_Q, device):
     model.eval()
     print(f"{sided_Q.capitalize()} Q-Network loaded")
     return model
+
+
+def _get_checkpoint_input_dim(checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get('rl_network_state_dict', {})
+    if 'head.weight' not in state_dict:
+        return None
+    return int(state_dict['head.weight'].shape[1])
 
 
 def _resolve_action_bounds(params):
@@ -234,7 +247,16 @@ def run(config, options, data, plot_hists):
     # Load the data
     encoded_data = np.load(os.path.join(params['data_dir'], f'encoded_{data}.npz'), allow_pickle=True)
 
-    params["input_dim"] = encoded_data['states'].shape[-1]
+    data_input_dim = encoded_data['states'].shape[-1]
+    ckpt_path = os.path.join(params['checkpoint_fname'], "best_q_parametersnegative.pt")
+    ckpt_input_dim = _get_checkpoint_input_dim(ckpt_path, device)
+    if ckpt_input_dim is not None and ckpt_input_dim != data_input_dim:
+        raise ValueError(
+            "Input-dimension mismatch between encoded data and checkpoint. "
+            f"Encoded data has {data_input_dim} features, but checkpoint expects {ckpt_input_dim}. "
+            "Use a checkpoint trained with the same encoder/data, or regenerate the encoded data to match the checkpoint."
+        )
+    params["input_dim"] = data_input_dim
 
     # For ContinuousIQN, compute per-dim state mean/std from training data so that
     # the network's _s_mean/_s_scale are 116-dim (matching the NCDE-encoded states)
