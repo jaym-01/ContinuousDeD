@@ -1,10 +1,6 @@
 .venv
-*runs/*
 __pycache__
 
-# Large data files (exceed GitHub's 100MB limit)
-data/continuous_mimic/reduced_format.npz
-data/continuous_mimic/reduced_format_overlapCohort.npz
-data/continuous_mimic/rectilinear_processed/improved-neural-cdes_data.npz
-data/continuous_mimic/rectilinear_processed/improved-neural-cdes_data_overlapData.npz
-data/continuous_mimic/combined_features.csv
+runs/
+
+data/continuous_mimic/*/
