@@ -16,7 +16,7 @@ import torch
 from rl_utils import RLDataLoader, DQN_Agent, IQN_Agent, create_analysis_df, ContinuousIQN_OfflineAgent
 from plot_utils import plot_value_hists
 from analysis_utils import get_dn_rn_info, create_analysis_df
-from boundary_tracing import dead_end_volume_fraction
+from boundary_tracing import dead_end_volume_fraction, dead_end_volume_fraction_multi_alpha
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
@@ -30,7 +30,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_best_rl(params, sided_Q, device):
     best_rl_path = os.path.join(params['checkpoint_fname'], f"best_q_parameters{sided_Q}.pt")
-    best_rl_checkpoint = torch.load(best_rl_path)
+    best_rl_checkpoint = torch.load(best_rl_path, weights_only=False)
 
     # Initialize the model
     if params['model'] == 'DQN':
@@ -50,19 +50,27 @@ def load_best_rl(params, sided_Q, device):
 
 
 def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
-                                  bnd_M=10, bnd_alpha=0.1, bnd_delta_D=-0.5):
-    """Compute dead-end volume fraction f_D per state using boundary tracing.
+                                  bnd_M=10, bnd_alphas=(0.1,), bnd_delta_D=-0.5):
+    """Compute dead-end volume fraction f_D per state for all alpha values in one pass.
 
-    v_dn = -f_D  (range [-1, 0]) and v_rn = 1 - f_D  (range [0, 1]) are stored
-    so that compare_flag_range flags a state at threshold thr when f_D > 1 - thr.
-    At the canonical thr=0.5 this correctly flags states with f_D > 0.5.
+    The M×M grid forward pass is shared across all alpha values so the network is
+    queried once per state regardless of how many alpha levels are requested.
+
+    Returns
+    -------
+    data_by_alpha : dict {alpha: pd.DataFrame}  — one DataFrame per alpha level,
+                    each with columns traj, step, s, a, f_D, v_dn, v_rn, category, stay_id
     """
     n_total = len(encoded_data['states'])
     action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
     action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
+    alphas = list(bnd_alphas)
 
-    rows = []
-    print(f"Computing dead-end volume fractions via boundary tracing (M={bnd_M}, alpha={bnd_alpha})...")
+    rows_by_alpha = {float(a): [] for a in alphas}
+
+    print(f"Computing dead-end volume fractions via boundary tracing "
+          f"(M={bnd_M}, {len(alphas)} alpha levels, shared grid scan)...")
+
     for traj in range(n_total):
         traj_len = int(encoded_data['lengths'][traj][0])
         traj_r   = encoded_data['rewards'][traj][:traj_len]
@@ -75,29 +83,31 @@ def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
 
         for t in range(traj_len):
             state = encoded_data['states'][traj][t]
-            f_D, _ = dead_end_volume_fraction(
+            f_D_per_alpha = dead_end_volume_fraction_multi_alpha(
                 state, qnet_dn,
+                alphas=alphas,
                 delta_D=bnd_delta_D,
-                alpha=bnd_alpha,
                 M=bnd_M,
                 action_low=action_low,
                 action_high=action_high,
             )
-            rows.append({
-                'traj':     traj,
-                'step':     t,
-                's':        state,
-                'a':        traj_a[t],
-                'f_D':      f_D,
-                'v_dn':     -f_D,        # flags when v_dn < (thr - 1), i.e. f_D > 1 - thr
-                'v_rn':     1.0 - f_D,   # flags when v_rn < thr, i.e. f_D > 1 - thr
-                'category': category,
-                'stay_id':  traj_sid,
-            })
+            for alpha, f_D in f_D_per_alpha.items():
+                rows_by_alpha[alpha].append({
+                    'traj':     traj,
+                    'step':     t,
+                    's':        state,
+                    'a':        traj_a[t],
+                    'f_D':      f_D,
+                    'v_dn':     -f_D,
+                    'v_rn':     1.0 - f_D,
+                    'category': category,
+                    'stay_id':  traj_sid,
+                })
+
         if (traj + 1) % 50 == 0:
             print(f"  {traj + 1}/{n_total} trajectories processed")
 
-    return pd.DataFrame(rows)
+    return {a: pd.DataFrame(rows) for a, rows in rows_by_alpha.items()}
 
 #############################
 ##     MAIN EXECUTOR
@@ -146,6 +156,21 @@ def run(config, options, data, plot_hists):
 
     params["input_dim"] = encoded_data['states'].shape[-1]
 
+    # For ContinuousIQN, compute per-dim state mean/std from training data so that
+    # the network's _s_mean/_s_scale are 116-dim (matching the NCDE-encoded states)
+    # rather than falling back to the 4-dim SpaceEnv hardcoded defaults.
+    if params.get('model') == 'ContinuousIQN':
+        print("Computing state normalisation statistics from training data...")
+        tr_npz  = np.load(os.path.join(params['data_dir'], 'encoded_train.npz'), allow_pickle=True)
+        val_npz = np.load(os.path.join(params['data_dir'], 'encoded_validation.npz'), allow_pickle=True)
+        state_dim = params["input_dim"]
+        all_states = np.concatenate([
+            tr_npz['states'].reshape(-1, state_dim),
+            val_npz['states'].reshape(-1, state_dim),
+        ], axis=0)
+        params['state_mean'] = all_states.mean(axis=0)
+        params['state_std']  = all_states.std(axis=0).clip(min=1e-8)
+
     print("Loading best Q-Networks and making Q-values ...")
 
     # Initialize and load the trained models
@@ -159,15 +184,13 @@ def run(config, options, data, plot_hists):
     if continuous:
         alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
         alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
-        data_by_alpha = {}
-        for alpha in alpha_sweep:
-            data_alpha = get_continuous_dead_end_data(
-                qnet_dn, encoded_data, device, params,
-                bnd_M=params.get('bnd_M', 10),
-                bnd_alpha=float(alpha),
-                bnd_delta_D=params.get('bnd_delta_D', -0.5),
-            )
-            data_by_alpha[float(alpha)] = data_alpha
+        # Process all alpha levels in one pass per state (shared grid forward pass)
+        data_by_alpha = get_continuous_dead_end_data(
+            qnet_dn, encoded_data, device, params,
+            bnd_M=params.get('bnd_M', 10),
+            bnd_alphas=[float(a) for a in alpha_sweep],
+            bnd_delta_D=params.get('bnd_delta_D', -0.5),
+        )
 
         first_alpha = float(alpha_sweep[0])
         data_ref = data_by_alpha[first_alpha]
