@@ -154,56 +154,88 @@ def run(config, options, data, plot_hists):
 
     continuous = params['model'] == 'ContinuousIQN'
     distributional = False  # overridden below for discrete IQN
+    VaR_thresholds = np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
 
     if continuous:
-        # Continuous action space: classify each state via dead-end volume fraction
-        data = get_continuous_dead_end_data(
-            qnet_dn, encoded_data, device, params,
-            bnd_M=params.get('bnd_M', 10),
-            bnd_alpha=params.get('bnd_alpha', 0.1),
-            bnd_delta_D=params.get('bnd_delta_D', -0.5),
-        )
+        alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
+        alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
+        data_by_alpha = {}
+        for alpha in alpha_sweep:
+            data_alpha = get_continuous_dead_end_data(
+                qnet_dn, encoded_data, device, params,
+                bnd_M=params.get('bnd_M', 10),
+                bnd_alpha=float(alpha),
+                bnd_delta_D=params.get('bnd_delta_D', -0.5),
+            )
+            data_by_alpha[float(alpha)] = data_alpha
+
+        first_alpha = float(alpha_sweep[0])
+        data_ref = data_by_alpha[first_alpha]
+        results = {"survivors": {}, "nonsurvivors": {}}
+        non_survivor_trajectories = sorted(data_ref[data_ref.category == -1].traj.unique().tolist())
+        survivor_trajectories = sorted(data_ref[data_ref.category == 1].traj.unique().tolist())
+        for i, trajectories in enumerate([non_survivor_trajectories, survivor_trajectories]):
+            if i == 0:
+                traj_type = "nonsurvivors"
+                print("----------- Non-survivors")
+            else:
+                traj_type = "survivors"
+                print("+++++++++++ Survivors")
+
+            dn_q_selected_action_traj = []
+            rn_q_selected_action_traj = []
+            dn_v_median_traj = []
+            rn_v_median_traj = []
+            sid_traj = []
+            for traj in trajectories:
+                d_ref = data_ref[data_ref.traj == traj]
+                sid_traj.append(d_ref.stay_id.tolist()[0])
+
+                f_D_alpha = []
+                for alpha in alpha_sweep:
+                    d_alpha = data_by_alpha[float(alpha)]
+                    d_traj = d_alpha[d_alpha.traj == traj]
+                    f_D_alpha.append(d_traj.f_D.values.astype(np.float32))
+
+                f_D_stack = np.stack(f_D_alpha, axis=1)
+                dn_q_selected_action_traj.append(-f_D_stack)
+                rn_q_selected_action_traj.append(1.0 - f_D_stack)
+                dn_v_median_traj.append(-f_D_stack)
+                rn_v_median_traj.append(1.0 - f_D_stack)
+
+            results[traj_type]["dn_q_selected_action_traj"] = dn_q_selected_action_traj
+            results[traj_type]["rn_q_selected_action_traj"] = rn_q_selected_action_traj
+            results[traj_type]["stay_ids"] = sid_traj
+            results[traj_type]["dn_v_median_traj"] = dn_v_median_traj
+            results[traj_type]["rn_v_median_traj"] = rn_v_median_traj
+
+        value_data = {"alpha": alpha_sweep, "data": data_by_alpha}
     else:
         # Discrete action space: retrieve Q-values for each state (for all actions)
         distributional = params['model'] == "IQN"
         data = get_dn_rn_info(qnet_dn, qnet_rn, encoded_data, device, distributional=distributional)
         data = pd.DataFrame(data)
 
-    with open(os.path.join(params['checkpoint_fname'], "value_data"+addon+".pkl"), "wb") as f:
-        pickle.dump(data, f)
-
-    with open(os.path.join(local_storage_dir, "value_data"+addon+".pkl"), "wb") as f:
-        pickle.dump(data, f)
-
-    VaR_thresholds =  np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
-    results = {"survivors": {}, "nonsurvivors": {}}
-    non_survivor_trajectories = sorted(data[data.category == -1].traj.unique().tolist())
-    survivor_trajectories = sorted(data[data.category == 1].traj.unique().tolist())
-    for i, trajectories in enumerate([non_survivor_trajectories, survivor_trajectories]):
-        if i == 0:
-            traj_type = "nonsurvivors"
-            print("----------- Non-survivors")
-        else:
-            traj_type = "survivors"
-            print("+++++++++++ Survivors")
-
-        dn_q_selected_action_traj = []
-        rn_q_selected_action_traj = []
-        dn_v_median_traj = []
-        rn_v_median_traj = []
-        sid_traj = []
-        for traj in trajectories:
-            d = data[data.traj == traj]
-            sid_traj.append(d.stay_id.tolist()[0])
-
-            if continuous:
-                # v_dn = -f_D, v_rn = 1 - f_D; shape (T,) per trajectory
-                f_D_traj = d.f_D.values.astype(np.float32)      # (T,)
-                dn_q_selected_action_traj.append(-f_D_traj)
-                rn_q_selected_action_traj.append(1.0 - f_D_traj)
-                dn_v_median_traj.append(-f_D_traj)
-                rn_v_median_traj.append(1.0 - f_D_traj)
+        results = {"survivors": {}, "nonsurvivors": {}}
+        non_survivor_trajectories = sorted(data[data.category == -1].traj.unique().tolist())
+        survivor_trajectories = sorted(data[data.category == 1].traj.unique().tolist())
+        for i, trajectories in enumerate([non_survivor_trajectories, survivor_trajectories]):
+            if i == 0:
+                traj_type = "nonsurvivors"
+                print("----------- Non-survivors")
             else:
+                traj_type = "survivors"
+                print("+++++++++++ Survivors")
+
+            dn_q_selected_action_traj = []
+            rn_q_selected_action_traj = []
+            dn_v_median_traj = []
+            rn_v_median_traj = []
+            sid_traj = []
+            for traj in trajectories:
+                d = data[data.traj == traj]
+                sid_traj.append(d.stay_id.tolist()[0])
+
                 dn_q_traj = np.array(d.q_dn.tolist(), dtype=np.float32)
                 rn_q_traj = np.array(d.q_rn.tolist(), dtype=np.float32)
                 if not distributional:
@@ -229,11 +261,19 @@ def run(config, options, data, plot_hists):
                     dn_v_median_traj.append(np.median(cvar_dn_traj, axis=2))
                     rn_v_median_traj.append(np.median(cvar_rn_traj, axis=2))
 
-        results[traj_type]["dn_q_selected_action_traj"] = dn_q_selected_action_traj
-        results[traj_type]["rn_q_selected_action_traj"] = rn_q_selected_action_traj
-        results[traj_type]["stay_ids"] = sid_traj
-        results[traj_type]["dn_v_median_traj"] = dn_v_median_traj
-        results[traj_type]["rn_v_median_traj"] = rn_v_median_traj
+            results[traj_type]["dn_q_selected_action_traj"] = dn_q_selected_action_traj
+            results[traj_type]["rn_q_selected_action_traj"] = rn_q_selected_action_traj
+            results[traj_type]["stay_ids"] = sid_traj
+            results[traj_type]["dn_v_median_traj"] = dn_v_median_traj
+            results[traj_type]["rn_v_median_traj"] = rn_v_median_traj
+
+        value_data = data
+
+    with open(os.path.join(params['checkpoint_fname'], "value_data"+addon+".pkl"), "wb") as f:
+        pickle.dump(value_data, f)
+
+    with open(os.path.join(local_storage_dir, "value_data"+addon+".pkl"), "wb") as f:
+        pickle.dump(value_data, f)
 
     with open(os.path.join(params['checkpoint_fname'], "pre_flag_results"+addon+".pkl"), "wb") as f:
         pickle.dump(results, f)
@@ -248,7 +288,14 @@ def run(config, options, data, plot_hists):
 
         # Create arrays of additional subsampling of the computed values
         # This accounts for the extra outer loop needed to analyze the distributional RL results
-        if continuous or not distributional:
+        if continuous:
+            alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
+            alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
+            if len(alpha_sweep) > 1:
+                VaR_thresholds = alpha_sweep
+            else:
+                VaR_thresholds = [None]
+        elif not distributional:
             VaR_thresholds = [None]
         else:
             VaR_thresholds =  np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
