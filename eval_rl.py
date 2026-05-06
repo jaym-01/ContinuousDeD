@@ -177,6 +177,8 @@ def get_continuous_dead_end_data(
         if terminal_r not in (-1.0, 1.0):
             continue
 
+        print(f"  starting traj {traj} (len={traj_len})", flush=True)
+
         category = -1 if terminal_r < 0 else 1
         traj_sid = encoded_data['stay_ids'][traj]
         states = encoded_data['states'][traj][:traj_len]
@@ -219,6 +221,7 @@ def get_continuous_dead_end_data(
                 )
 
         n_done += 1
+        print(f"  finished traj {traj} ({n_done}/{n_valid})", flush=True)
         if log_every_traj and (n_done % log_every_traj == 0):
             print(f"  {n_done}/{n_valid} trajectories processed", flush=True)
 
@@ -430,6 +433,142 @@ def _assemble_pc_results(data_by_alpha, alphas_f):
         }
 
     return results
+
+
+def _probe_q_percentiles(qnet, encoded_data, params, percentiles, n_samples=500, alpha=0.1):
+    """Like _probe_q_percentile but returns all percentile values in one pass.
+
+    Avoids N_candidates separate 500-sample forward passes by doing one pass
+    and reading off all requested percentiles from the same CVaR distribution.
+    """
+    device = qnet.device
+    action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
+    action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
+    num_tau     = params.get('num_iqn_samples_est', 64)
+    n_traj      = len(encoded_data['states'])
+    rng         = np.random.RandomState(0)
+
+    states_list, actions_list = [], []
+    for _ in range(n_samples * 10):
+        traj     = rng.randint(n_traj)
+        traj_len = int(encoded_data['lengths'][traj].flat[0])
+        if traj_len == 0:
+            continue
+        t = rng.randint(traj_len)
+        states_list.append(encoded_data['states'][traj][t])
+        actions_list.append(np.array(
+            [rng.uniform(lo, hi) for lo, hi in zip(action_low, action_high)], dtype=np.float32
+        ))
+        if len(states_list) >= n_samples:
+            break
+
+    states_t  = torch.as_tensor(np.stack(states_list,  0).astype(np.float32), device=device)
+    actions_t = torch.as_tensor(np.stack(actions_list, 0).astype(np.float32), device=device)
+
+    qnet.eval()
+    with torch.no_grad():
+        quantiles, _ = qnet.network(states_t, actions_t, num_tau)
+    sorted_q = quantiles.squeeze(-1).sort(dim=1)[0]
+    k    = max(1, round(alpha * num_tau))
+    cvar = sorted_q[:, :k].mean(dim=1).cpu().numpy()
+
+    print(
+        f"Q-probe ({len(states_list)} pairs, α={alpha}): "
+        f"min={cvar.min():.4f}  p25={np.percentile(cvar,25):.4f}  "
+        f"median={np.median(cvar):.4f}  p75={np.percentile(cvar,75):.4f}  max={cvar.max():.4f}",
+        flush=True,
+    )
+    out = {pct: float(np.percentile(cvar, pct)) for pct in percentiles}
+    for pct, val in out.items():
+        print(f"  p{pct} = {val:.4f}", flush=True)
+    return out
+
+
+def _select_delta_D_grid(qnet_dn, qnet_rn, encoded_data, params, candidates, alphas_f, delta_D_rn, M=5):
+    """Pre-screen delta_D candidates using a fast grid approximation.
+
+    For each candidate delta_D, computes grid-based f_D / f_R in a single
+    batched forward pass per trajectory (vs. the full predictor-corrector which
+    does O(T × N_PC_iters) passes per trajectory). Typically 100–1000× cheaper.
+
+    The R-net fR values are cached once (delta_D_rn is fixed across candidates)
+    so only N_candidates D-net forward passes are needed across all trajectories.
+
+    Parameters
+    ----------
+    candidates : dict {percentile_label: delta_D}  e.g. {10: -0.12, 25: -0.08, ...}
+
+    Returns
+    -------
+    best_delta_D : float
+    best_label   : str  e.g. 'p25'
+    """
+    action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
+    action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
+    num_tau     = params.get('num_iqn_samples_est', 64)
+    n_total     = len(encoded_data['states'])
+
+    # Identify valid trajectories and cache R-net fR (fixed across all D-net candidates)
+    print(f"  [grid pre-screen] Caching R-net grid pass (delta_D_rn={delta_D_rn:.4f})...", flush=True)
+    valid_trajs  = []
+    vrn_cache    = {}
+    label_cache  = {}
+    for traj in range(n_total):
+        traj_len   = int(encoded_data['lengths'][traj].flat[0])
+        traj_r     = encoded_data['rewards'][traj][:traj_len]
+        terminal_r = float(traj_r[-1].flat[-1])
+        if terminal_r not in (-1.0, 1.0):
+            continue
+        states = encoded_data['states'][traj][:traj_len]
+        fR = dead_end_volume_fraction_grid_batch(
+            states, qnet_rn, alphas_f,
+            delta_D=delta_D_rn, M=M,
+            action_low=action_low, action_high=action_high,
+            num_tau=num_tau,
+        )
+        vrn_cache[traj]   = 1.0 - fR
+        label_cache[traj] = -1 if terminal_r < 0 else 1
+        valid_trajs.append(traj)
+
+    best_auc     = -1.0
+    best_label   = None
+    best_delta_D = None
+
+    print(f"  [grid pre-screen] Testing {len(candidates)} candidates over {len(valid_trajs)} trajectories...", flush=True)
+    for pct, delta_D_dn in candidates.items():
+        label = f'p{pct}'
+        ns_vdn, ns_vrn, s_vdn, s_vrn = [], [], [], []
+
+        for traj in valid_trajs:
+            traj_len = int(encoded_data['lengths'][traj].flat[0])
+            states   = encoded_data['states'][traj][:traj_len]
+            fD = dead_end_volume_fraction_grid_batch(
+                states, qnet_dn, alphas_f,
+                delta_D=delta_D_dn, M=M,
+                action_low=action_low, action_high=action_high,
+                num_tau=num_tau,
+            )
+            vdn = -fD
+            vrn = vrn_cache[traj]
+            if label_cache[traj] == -1:
+                ns_vdn.append(vdn); ns_vrn.append(vrn)
+            else:
+                s_vdn.append(vdn);  s_vrn.append(vrn)
+
+        mock = {
+            'nonsurvivors': {'dn_q_selected_action_traj': ns_vdn, 'rn_q_selected_action_traj': ns_vrn},
+            'survivors':    {'dn_q_selected_action_traj': s_vdn,  'rn_q_selected_action_traj': s_vrn},
+        }
+        auc = _quick_auc(mock)
+        print(f"    {label}: delta_D={delta_D_dn:.4f}  AUC={auc:.4f}", flush=True)
+
+        if auc > best_auc:
+            best_auc     = auc
+            best_label   = label
+            best_delta_D = delta_D_dn
+
+    print(f"  [grid pre-screen] Best: {best_label}={best_delta_D:.4f}  (AUC={best_auc:.4f})", flush=True)
+    return best_delta_D, best_label
 
 
 def _quick_auc(results, alpha_idx=0, n_thr=201):
@@ -701,25 +840,11 @@ def run(config, options, data, plot_hists):
                 **pc_kwargs,
             )
 
-            # --- D-net: sweep percentiles, pick the delta_D that maximises AUC.
-            # Each candidate runs the full predictor-corrector on all test
-            # trajectories; results are assembled and scored inline so we only
-            # keep the best set of v_dn/v_rn arrays.
+            # --- D-net: pre-screen candidates with a fast grid scan, then run PC once.
+            # Running the full predictor-corrector for each candidate is O(N_cand × n_traj × T × N_PC_iters).
+            # The grid scan is O(N_cand × n_traj) batched forward passes — typically 100-1000× cheaper.
+            # The R-net grid pass is cached once since delta_D_rn is fixed across candidates.
             sweep_percentiles = params.get('bnd_delta_D_sweep_percentiles', [10, 25, 40, 50, 60, 75])
-            if not params.get('bnd_delta_D_auto', True):
-                # Auto disabled: treat the hardcoded value as the single candidate.
-                sweep_percentiles = [None]
-
-            best_auc          = -1.0
-            best_delta_D_dn   = None
-            best_results      = None
-            auc_by_percentile = {}
-
-            print(
-                f"\nSweeping delta_D over percentiles {sweep_percentiles} "
-                f"(R-net fixed at delta_D_rn={delta_D_rn:.4f})...",
-                flush=True,
-            )
 
             def _merge_results(data_dn, data_rn, alphas_f):
                 merged = {}
@@ -732,55 +857,43 @@ def run(config, options, data, plot_hists):
                     merged[alpha] = m
                 return merged
 
-            for pct in sweep_percentiles:
-                if pct is None:
-                    delta_D_dn = params.get('bnd_delta_D', -0.5)
-                    pct_label  = 'fixed'
-                else:
-                    delta_D_dn = _probe_q_percentile(
-                        qnet_dn, encoded_data, params,
-                        percentile=pct, n_samples=500, alpha=float(alphas_f[0]),
-                    )
-                    pct_label = f'p{pct}'
-
-                data_by_alpha_dn = get_continuous_dead_end_data(
-                    qnet_dn, encoded_data, device, params,
-                    bnd_alphas=alphas_f,
-                    bnd_delta_D=delta_D_dn,
-                    checkpoint_path=os.path.join(
-                        params['checkpoint_fname'], f'pc_dn_{pct_label}_ckpt{addon}.pkl'
-                    ),
-                    **pc_kwargs,
+            if not params.get('bnd_delta_D_auto', True):
+                delta_D_dn = params.get('bnd_delta_D', -0.5)
+                pct_label  = 'fixed'
+            else:
+                candidates = _probe_q_percentiles(
+                    qnet_dn, encoded_data, params,
+                    percentiles=sweep_percentiles, n_samples=500, alpha=float(alphas_f[0]),
+                )
+                delta_D_dn, pct_label = _select_delta_D_grid(
+                    qnet_dn, qnet_rn, encoded_data, params,
+                    candidates=candidates, alphas_f=alphas_f,
+                    delta_D_rn=delta_D_rn,
+                    M=params.get('bnd_M', 5),
                 )
 
-                cand_results = _assemble_pc_results(
-                    _merge_results(data_by_alpha_dn, data_by_alpha_rn, alphas_f), alphas_f
-                )
-                auc = _quick_auc(cand_results)
-                auc_by_percentile[pct_label] = {'delta_D': delta_D_dn, 'auc': auc}
-                print(f"  delta_D {pct_label} = {delta_D_dn:.4f}  →  AUC = {auc:.4f}", flush=True)
-
-                if auc > best_auc:
-                    best_auc        = auc
-                    best_delta_D_dn = delta_D_dn
-                    best_results    = cand_results
-
-            best_label = max(auc_by_percentile, key=lambda k: auc_by_percentile[k]['auc'])
-            print(
-                f"\nBest delta_D: {best_label} = {best_delta_D_dn:.4f}  (AUC = {best_auc:.4f})",
-                flush=True,
+            print(f"\nRunning predictor-corrector with delta_D_dn={delta_D_dn:.4f} ({pct_label})...", flush=True)
+            data_by_alpha_dn = get_continuous_dead_end_data(
+                qnet_dn, encoded_data, device, params,
+                bnd_alphas=alphas_f,
+                bnd_delta_D=delta_D_dn,
+                checkpoint_path=os.path.join(
+                    params['checkpoint_fname'], f'pc_dn_{pct_label}_ckpt{addon}.pkl'
+                ),
+                **pc_kwargs,
             )
-            print("AUC sweep summary:", flush=True)
-            for lbl, v in auc_by_percentile.items():
-                print(f"  {lbl}: delta_D={v['delta_D']:.4f}  AUC={v['auc']:.4f}", flush=True)
 
-            results    = best_results
+            results = _assemble_pc_results(
+                _merge_results(data_by_alpha_dn, data_by_alpha_rn, alphas_f), alphas_f
+            )
+            final_auc = _quick_auc(results)
+            print(f"PC AUC with delta_D {pct_label}={delta_D_dn:.4f}: {final_auc:.4f}", flush=True)
+
             value_data = {
-                'alpha':             alpha_sweep,
-                'delta_D_dn':        best_delta_D_dn,
-                'delta_D_rn':        delta_D_rn,
-                'results':           results,
-                'auc_sweep':         auc_by_percentile,
+                'alpha':      alpha_sweep,
+                'delta_D_dn': delta_D_dn,
+                'delta_D_rn': delta_D_rn,
+                'results':    results,
             }
 
         else:  # 'grid_cvar' — fast approximation, no delta_D needed
