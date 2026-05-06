@@ -13,13 +13,10 @@ import matplotlib.pyplot as plt
 
 import torch
 
-from rl_utils import RLDataLoader, DQN_Agent, IQN_Agent, create_analysis_df, ContinuousIQN_OfflineAgent
+from rl_utils import DQN_Agent, IQN_Agent, ContinuousIQN_OfflineAgent
 from plot_utils import plot_value_hists
 from analysis_utils import get_dn_rn_info, create_analysis_df
-from boundary_tracing import (dead_end_volume_fraction,
-                               dead_end_volume_fraction_multi_alpha,
-                               dead_end_volume_fraction_grid,
-                               dead_end_volume_fraction_grid_batch)
+from boundary_tracing import dead_end_volume_fraction_multi_alpha
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
@@ -33,7 +30,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_best_rl(params, sided_Q, device):
     best_rl_path = os.path.join(params['checkpoint_fname'], f"best_q_parameters{sided_Q}.pt")
-    best_rl_checkpoint = torch.load(best_rl_path, weights_only=False)
+    best_rl_checkpoint = torch.load(best_rl_path, map_location=device, weights_only=False)
 
     # Initialize the model
     if params['model'] == 'DQN':
@@ -52,34 +49,56 @@ def load_best_rl(params, sided_Q, device):
     return model
 
 
-def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
-                                  bnd_M=10, bnd_alphas=(0.1,), bnd_delta_D=-0.5,
-                                  checkpoint_path=None, checkpoint_every=100):
+def _resolve_action_bounds(params):
+    action_dim = params.get('action_dim', 2)
+    action_low = params.get('action_low', [0.0] * action_dim)
+    action_high = params.get('action_high', [1.0] * action_dim)
+    if len(action_low) != action_dim or len(action_high) != action_dim:
+        raise ValueError("action_low/action_high length must match action_dim")
+    return action_low, action_high
+
+
+def get_continuous_dead_end_data(
+    qnet_dn,
+    encoded_data,
+    device,
+    params,
+    bnd_M=20,
+    bnd_alphas=(0.1,),
+    bnd_delta_D=-0.5,
+    bnd_h0=0.05,
+    bnd_eps_tol=1e-4,
+    bnd_eps_close=0.02,
+    bnd_eps_dup=0.02,
+    bnd_eta=1.5,
+    bnd_C_max=10,
+    bnd_num_tau=64,
+    checkpoint_path=None,
+    checkpoint_every=100,
+    log_every_traj=10,
+    log_every_state=0,
+):
     """Compute dead-end volume fraction f_D per state for all alpha values.
 
-    Processes one trajectory at a time with a single batched forward pass of
-    size T×M² (T = trajectory length), so the GPU sees a meaningful batch rather
-    than one state at a time.
-
+    Uses predictor-corrector boundary tracing (Algorithm 1) for continuous IQN.
     Supports checkpoint/resume: saves progress every `checkpoint_every` valid
-    trajectories to `checkpoint_path`. On startup, resumes from checkpoint if found.
+    trajectories to `checkpoint_path` (per-trajectory granularity).
 
     Returns
     -------
     data_by_alpha : dict {alpha: pd.DataFrame}
     """
     n_total = len(encoded_data['states'])
-    action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
-    action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
-    alphas = list(bnd_alphas)
-    alphas_f = [float(a) for a in alphas]
+    action_low, action_high = _resolve_action_bounds(params)
+    alphas_f = [float(a) for a in bnd_alphas]
 
     n_valid = sum(
-        1 for i in range(n_total)
-        if float(encoded_data['rewards'][i][int(encoded_data['lengths'][i].flat[0]) - 1].flat[-1]) in (-1.0, 1.0)
+        1
+        for i in range(n_total)
+        if float(encoded_data['rewards'][i][int(encoded_data['lengths'][i].flat[0]) - 1].flat[-1])
+        in (-1.0, 1.0)
     )
 
-    # --- resume from checkpoint if available ---
     rows_by_alpha = {a: [] for a in alphas_f}
     resume_from_traj = 0
     n_done = 0
@@ -87,57 +106,84 @@ def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
         print(f"Resuming from checkpoint: {checkpoint_path}", flush=True)
         with open(checkpoint_path, 'rb') as f:
             ckpt = pickle.load(f)
-        rows_by_alpha    = ckpt['rows_by_alpha']
+        rows_by_alpha = ckpt['rows_by_alpha']
         resume_from_traj = ckpt['next_traj']
-        n_done           = ckpt['n_done']
-        print(f"  Resuming at trajectory index {resume_from_traj} ({n_done}/{n_valid} done)", flush=True)
+        n_done = ckpt['n_done']
+        print(
+            f"  Resuming at trajectory index {resume_from_traj} ({n_done}/{n_valid} done)",
+            flush=True,
+        )
 
-    print(f"Computing dead-end volume fractions via grid estimator "
-          f"(M={bnd_M}, {len(alphas)} alpha levels, 1 forward pass per trajectory) "
-          f"— {n_valid} valid trajectories...", flush=True)
+    print(
+        "Computing dead-end volume fractions via predictor-corrector tracing "
+        f"(M={bnd_M}, {len(alphas_f)} alpha levels) — {n_valid} valid trajectories...",
+        flush=True,
+    )
 
     for traj in range(resume_from_traj, n_total):
-        traj_len   = int(encoded_data['lengths'][traj].flat[0])
-        traj_r     = encoded_data['rewards'][traj][:traj_len]
+        traj_len = int(encoded_data['lengths'][traj].flat[0])
+        traj_r = encoded_data['rewards'][traj][:traj_len]
         terminal_r = float(traj_r[-1].flat[-1])
         if terminal_r not in (-1.0, 1.0):
             continue
 
         category = -1 if terminal_r < 0 else 1
         traj_sid = encoded_data['stay_ids'][traj]
-        states   = encoded_data['states'][traj][:traj_len]  # (T, state_dim)
+        states = encoded_data['states'][traj][:traj_len]
 
-        # One forward pass for all T states × M² actions
-        f_D_mat = dead_end_volume_fraction_grid_batch(
-            states, qnet_dn,
-            alphas=alphas_f,
-            delta_D=bnd_delta_D,
-            M=bnd_M,
-            action_low=action_low,
-            action_high=action_high,
-        )  # (T, len(alphas))
+        for t in range(traj_len):
+            f_D_per_alpha = dead_end_volume_fraction_multi_alpha(
+                states[t],
+                qnet_dn,
+                alphas=alphas_f,
+                delta_D=bnd_delta_D,
+                M=bnd_M,
+                h0=bnd_h0,
+                eps_tol=bnd_eps_tol,
+                eps_close=bnd_eps_close,
+                eps_dup=bnd_eps_dup,
+                eta=bnd_eta,
+                C_max=bnd_C_max,
+                action_low=action_low,
+                action_high=action_high,
+                num_tau=bnd_num_tau,
+            )
+            if log_every_state and (t % log_every_state == 0):
+                print(
+                    f"  traj {traj} step {t}/{traj_len} (alpha={alphas_f[0]:.2f}..{alphas_f[-1]:.2f})",
+                    flush=True,
+                )
 
-        for alpha, j in zip(alphas_f, range(len(alphas_f))):
-            f_D_vec = f_D_mat[:, j].tolist()
-            rows_by_alpha[alpha].extend([
-                {'traj': traj, 'step': t, 'f_D': f_D_vec[t],
-                 'v_dn': -f_D_vec[t], 'v_rn': 1.0 - f_D_vec[t],
-                 'category': category, 'stay_id': traj_sid}
-                for t in range(traj_len)
-            ])
+            for alpha in alphas_f:
+                f_d = float(f_D_per_alpha[alpha])
+                rows_by_alpha[alpha].append(
+                    {
+                        'traj': traj,
+                        'step': t,
+                        'f_D': f_d,
+                        'v_dn': -f_d,
+                        'v_rn': 1.0 - f_d,
+                        'category': category,
+                        'stay_id': traj_sid,
+                    }
+                )
 
         n_done += 1
-        if n_done % 10 == 0:
+        if log_every_traj and (n_done % log_every_traj == 0):
             print(f"  {n_done}/{n_valid} trajectories processed", flush=True)
 
         if checkpoint_path and n_done % checkpoint_every == 0:
             with open(checkpoint_path, 'wb') as f:
-                pickle.dump({'rows_by_alpha': rows_by_alpha,
-                             'next_traj': traj + 1,
-                             'n_done': n_done}, f)
+                pickle.dump(
+                    {
+                        'rows_by_alpha': rows_by_alpha,
+                        'next_traj': traj + 1,
+                        'n_done': n_done,
+                    },
+                    f,
+                )
             print(f"  [checkpoint saved at {n_done}/{n_valid}]", flush=True)
 
-    # remove checkpoint on successful completion
     if checkpoint_path and os.path.exists(checkpoint_path):
         os.remove(checkpoint_path)
         print("Checkpoint removed (run complete).")
@@ -218,15 +264,26 @@ def run(config, options, data, plot_hists):
     if continuous:
         alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
         alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
-        # Process all alpha levels in one pass per state (shared grid forward pass)
         ckpt_path = os.path.join(params['checkpoint_fname'], f"eval_checkpoint_{data}.pkl")
         data_by_alpha = get_continuous_dead_end_data(
-            qnet_dn, encoded_data, device, params,
-            bnd_M=params.get('bnd_M', 10),
+            qnet_dn,
+            encoded_data,
+            device,
+            params,
+            bnd_M=params.get('bnd_M', 20),
             bnd_alphas=[float(a) for a in alpha_sweep],
             bnd_delta_D=params.get('bnd_delta_D', -0.5),
+            bnd_h0=params.get('bnd_h0', 0.05),
+            bnd_eps_tol=params.get('bnd_eps_tol', 1e-4),
+            bnd_eps_close=params.get('bnd_eps_close', 0.02),
+            bnd_eps_dup=params.get('bnd_eps_dup', 0.02),
+            bnd_eta=params.get('bnd_eta', 1.5),
+            bnd_C_max=params.get('bnd_C_max', 10),
+            bnd_num_tau=params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64)),
             checkpoint_path=ckpt_path,
             checkpoint_every=params.get('eval_checkpoint_every', 100),
+            log_every_traj=params.get('eval_log_every_traj', 10),
+            log_every_state=params.get('eval_log_every_state', 0),
         )
 
         alphas_f = [float(a) for a in alpha_sweep]
