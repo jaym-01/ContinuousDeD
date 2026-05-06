@@ -35,6 +35,10 @@ def load_best_rl(params, sided_Q, device):
     # Align model input size with checkpoint to avoid silent shape mismatches.
     if 'rl_network_state_dict' in best_rl_checkpoint and 'head.weight' in best_rl_checkpoint['rl_network_state_dict']:
         ckpt_in_dim = best_rl_checkpoint['rl_network_state_dict']['head.weight'].shape[1]
+        # For ContinuousIQN, head takes [state ∥ action], so head_dim = state_dim + action_dim.
+        # Subtract action_dim to recover the pure state_dim.
+        if params.get('model') == 'ContinuousIQN':
+            ckpt_in_dim -= params.get('action_dim', 0)
         params['input_dim'] = int(ckpt_in_dim)
 
     # Initialize the model
@@ -60,6 +64,39 @@ def _get_checkpoint_input_dim(checkpoint_path, device):
     if 'head.weight' not in state_dict:
         return None
     return int(state_dict['head.weight'].shape[1])
+
+
+def _adjust_state_dim(states, target_dim, label="states"):
+    """Pad or truncate the last dimension to match target_dim."""
+    cur_dim = states.shape[-1]
+    if cur_dim == target_dim:
+        return states
+    if cur_dim < target_dim:
+        pad = target_dim - cur_dim
+        print(
+            f"Warning: {label} has {cur_dim} features; padding with {pad} zeros to match {target_dim}.",
+            flush=True,
+        )
+        return np.pad(states, ((0, 0), (0, 0), (0, pad)), mode="constant")
+    # cur_dim > target_dim
+    drop = cur_dim - target_dim
+    print(
+        f"Warning: {label} has {cur_dim} features; truncating last {drop} to match {target_dim}.",
+        flush=True,
+    )
+    return states[..., :target_dim]
+
+
+def _coerce_encoded_state_dim(encoded_data, target_dim, label):
+    """Return a dict-like encoded_data with states adjusted to target_dim."""
+    states = encoded_data['states']
+    if states.shape[-1] == target_dim:
+        return encoded_data
+
+    # Materialize arrays so we can safely replace states.
+    data_dict = {k: encoded_data[k] for k in encoded_data.files}
+    data_dict['states'] = _adjust_state_dim(data_dict['states'], target_dim, label=label)
+    return data_dict
 
 
 def _resolve_action_bounds(params):
@@ -250,12 +287,26 @@ def run(config, options, data, plot_hists):
     data_input_dim = encoded_data['states'].shape[-1]
     ckpt_path = os.path.join(params['checkpoint_fname'], "best_q_parametersnegative.pt")
     ckpt_input_dim = _get_checkpoint_input_dim(ckpt_path, device)
-    if ckpt_input_dim is not None and ckpt_input_dim != data_input_dim:
-        raise ValueError(
+
+    # For ContinuousIQN, the checkpoint head takes [state ∥ action] so head_dim = state_dim + action_dim.
+    # Recover the pure state_dim before comparing with the encoded data dimension.
+    ckpt_state_dim = ckpt_input_dim
+    if ckpt_input_dim is not None and params.get('model') == 'ContinuousIQN':
+        ckpt_state_dim = ckpt_input_dim - params.get('action_dim', 0)
+
+    if ckpt_state_dim is not None and ckpt_state_dim != data_input_dim:
+        print(
             "Input-dimension mismatch between encoded data and checkpoint. "
-            f"Encoded data has {data_input_dim} features, but checkpoint expects {ckpt_input_dim}. "
-            "Use a checkpoint trained with the same encoder/data, or regenerate the encoded data to match the checkpoint."
+            f"Encoded data has {data_input_dim} features, but checkpoint expects {ckpt_state_dim}.",
+            flush=True,
         )
+        encoded_data = _coerce_encoded_state_dim(
+            encoded_data,
+            ckpt_state_dim,
+            label=f"encoded_{data}",
+        )
+        data_input_dim = ckpt_state_dim
+
     params["input_dim"] = data_input_dim
 
     # For ContinuousIQN, compute per-dim state mean/std from training data so that
@@ -266,9 +317,11 @@ def run(config, options, data, plot_hists):
         tr_npz  = np.load(os.path.join(params['data_dir'], 'encoded_train.npz'), allow_pickle=True)
         val_npz = np.load(os.path.join(params['data_dir'], 'encoded_validation.npz'), allow_pickle=True)
         state_dim = params["input_dim"]
+        tr_states = _adjust_state_dim(tr_npz['states'], state_dim, label="encoded_train")
+        val_states = _adjust_state_dim(val_npz['states'], state_dim, label="encoded_validation")
         all_states = np.concatenate([
-            tr_npz['states'].reshape(-1, state_dim),
-            val_npz['states'].reshape(-1, state_dim),
+            tr_states.reshape(-1, state_dim),
+            val_states.reshape(-1, state_dim),
         ], axis=0)
         params['state_mean'] = all_states.mean(axis=0)
         params['state_std']  = all_states.std(axis=0).clip(min=1e-8)
