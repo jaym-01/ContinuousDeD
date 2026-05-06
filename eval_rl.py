@@ -53,12 +53,16 @@ def load_best_rl(params, sided_Q, device):
 
 
 def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
-                                  bnd_M=10, bnd_alphas=(0.1,), bnd_delta_D=-0.5):
+                                  bnd_M=10, bnd_alphas=(0.1,), bnd_delta_D=-0.5,
+                                  checkpoint_path=None, checkpoint_every=100):
     """Compute dead-end volume fraction f_D per state for all alpha values.
 
     Processes one trajectory at a time with a single batched forward pass of
     size T×M² (T = trajectory length), so the GPU sees a meaningful batch rather
     than one state at a time.
+
+    Supports checkpoint/resume: saves progress every `checkpoint_every` valid
+    trajectories to `checkpoint_path`. On startup, resumes from checkpoint if found.
 
     Returns
     -------
@@ -70,18 +74,29 @@ def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
     alphas = list(bnd_alphas)
     alphas_f = [float(a) for a in alphas]
 
-    rows_by_alpha = {a: [] for a in alphas_f}
-
     n_valid = sum(
         1 for i in range(n_total)
         if float(encoded_data['rewards'][i][int(encoded_data['lengths'][i].flat[0]) - 1].flat[-1]) in (-1.0, 1.0)
     )
+
+    # --- resume from checkpoint if available ---
+    rows_by_alpha = {a: [] for a in alphas_f}
+    resume_from_traj = 0
+    n_done = 0
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Resuming from checkpoint: {checkpoint_path}", flush=True)
+        with open(checkpoint_path, 'rb') as f:
+            ckpt = pickle.load(f)
+        rows_by_alpha    = ckpt['rows_by_alpha']
+        resume_from_traj = ckpt['next_traj']
+        n_done           = ckpt['n_done']
+        print(f"  Resuming at trajectory index {resume_from_traj} ({n_done}/{n_valid} done)", flush=True)
+
     print(f"Computing dead-end volume fractions via grid estimator "
           f"(M={bnd_M}, {len(alphas)} alpha levels, 1 forward pass per trajectory) "
-          f"— {n_valid} valid trajectories...")
+          f"— {n_valid} valid trajectories...", flush=True)
 
-    n_done = 0
-    for traj in range(n_total):
+    for traj in range(resume_from_traj, n_total):
         traj_len   = int(encoded_data['lengths'][traj].flat[0])
         traj_r     = encoded_data['rewards'][traj][:traj_len]
         terminal_r = float(traj_r[-1].flat[-1])
@@ -90,7 +105,6 @@ def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
 
         category = -1 if terminal_r < 0 else 1
         traj_sid = encoded_data['stay_ids'][traj]
-        traj_a   = encoded_data['actions'][traj][:traj_len]
         states   = encoded_data['states'][traj][:traj_len]  # (T, state_dim)
 
         # One forward pass for all T states × M² actions
@@ -103,24 +117,30 @@ def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
             action_high=action_high,
         )  # (T, len(alphas))
 
-        for t in range(traj_len):
-            for j, alpha in enumerate(alphas_f):
-                f_D = float(f_D_mat[t, j])
-                rows_by_alpha[alpha].append({
-                    'traj':     traj,
-                    'step':     t,
-                    's':        states[t],
-                    'a':        traj_a[t],
-                    'f_D':      f_D,
-                    'v_dn':     -f_D,
-                    'v_rn':     1.0 - f_D,
-                    'category': category,
-                    'stay_id':  traj_sid,
-                })
+        for alpha, j in zip(alphas_f, range(len(alphas_f))):
+            f_D_vec = f_D_mat[:, j].tolist()
+            rows_by_alpha[alpha].extend([
+                {'traj': traj, 'step': t, 'f_D': f_D_vec[t],
+                 'v_dn': -f_D_vec[t], 'v_rn': 1.0 - f_D_vec[t],
+                 'category': category, 'stay_id': traj_sid}
+                for t in range(traj_len)
+            ])
 
         n_done += 1
         if n_done % 10 == 0:
-            print(f"  {n_done}/{n_valid} trajectories processed")
+            print(f"  {n_done}/{n_valid} trajectories processed", flush=True)
+
+        if checkpoint_path and n_done % checkpoint_every == 0:
+            with open(checkpoint_path, 'wb') as f:
+                pickle.dump({'rows_by_alpha': rows_by_alpha,
+                             'next_traj': traj + 1,
+                             'n_done': n_done}, f)
+            print(f"  [checkpoint saved at {n_done}/{n_valid}]", flush=True)
+
+    # remove checkpoint on successful completion
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        print("Checkpoint removed (run complete).")
 
     return {a: pd.DataFrame(rows) for a, rows in rows_by_alpha.items()}
 
@@ -144,8 +164,7 @@ def run(config, options, data, plot_hists):
     addon = "_overlap" if data=='overlap' else ""
 
     local_storage_dir = os.path.join("stats", "/".join(split_fname[-3:]))
-    if not os.path.exists(local_storage_dir):
-        os.makedirs(local_storage_dir)
+    os.makedirs(local_storage_dir, exist_ok=True)
 
     # Replace configuration parameters by command line provided 'options'
     for opt in options:
@@ -200,25 +219,39 @@ def run(config, options, data, plot_hists):
         alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
         alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
         # Process all alpha levels in one pass per state (shared grid forward pass)
+        ckpt_path = os.path.join(params['checkpoint_fname'], f"eval_checkpoint_{data}.pkl")
         data_by_alpha = get_continuous_dead_end_data(
             qnet_dn, encoded_data, device, params,
             bnd_M=params.get('bnd_M', 10),
             bnd_alphas=[float(a) for a in alpha_sweep],
             bnd_delta_D=params.get('bnd_delta_D', -0.5),
+            checkpoint_path=ckpt_path,
+            checkpoint_every=params.get('eval_checkpoint_every', 100),
         )
 
-        first_alpha = float(alpha_sweep[0])
+        alphas_f = [float(a) for a in alpha_sweep]
+
+        # Build {traj_id: (T, n_alphas) f_D array} with one groupby per alpha
+        # instead of O(n_trajs × n_alphas) per-trajectory DataFrame filters.
+        print("Building per-trajectory f_D lookup...", flush=True)
+        traj_to_fD = {}
+        for j, alpha in enumerate(alphas_f):
+            for traj_id, grp in data_by_alpha[alpha].groupby('traj'):
+                fD_vec = grp.sort_values('step').f_D.values.astype(np.float32)
+                if traj_id not in traj_to_fD:
+                    traj_to_fD[traj_id] = np.zeros((len(fD_vec), len(alphas_f)), dtype=np.float32)
+                traj_to_fD[traj_id][:, j] = fD_vec
+
+        first_alpha = alphas_f[0]
         data_ref = data_by_alpha[first_alpha]
         results = {"survivors": {}, "nonsurvivors": {}}
         non_survivor_trajectories = sorted(data_ref[data_ref.category == -1].traj.unique().tolist())
         survivor_trajectories = sorted(data_ref[data_ref.category == 1].traj.unique().tolist())
-        for i, trajectories in enumerate([non_survivor_trajectories, survivor_trajectories]):
-            if i == 0:
-                traj_type = "nonsurvivors"
-                print("----------- Non-survivors")
-            else:
-                traj_type = "survivors"
-                print("+++++++++++ Survivors")
+
+        for traj_type, trajectories in [("nonsurvivors", non_survivor_trajectories),
+                                         ("survivors",    survivor_trajectories)]:
+            label = "----------- Non-survivors" if traj_type == "nonsurvivors" else "+++++++++++ Survivors"
+            print(label, flush=True)
 
             dn_q_selected_action_traj = []
             rn_q_selected_action_traj = []
@@ -226,16 +259,10 @@ def run(config, options, data, plot_hists):
             rn_v_median_traj = []
             sid_traj = []
             for traj in trajectories:
-                d_ref = data_ref[data_ref.traj == traj]
-                sid_traj.append(d_ref.stay_id.tolist()[0])
+                d_ref_traj = data_ref[data_ref.traj == traj]
+                sid_traj.append(d_ref_traj.stay_id.iloc[0])
 
-                f_D_alpha = []
-                for alpha in alpha_sweep:
-                    d_alpha = data_by_alpha[float(alpha)]
-                    d_traj = d_alpha[d_alpha.traj == traj]
-                    f_D_alpha.append(d_traj.f_D.values.astype(np.float32))
-
-                f_D_stack = np.stack(f_D_alpha, axis=1)
+                f_D_stack = traj_to_fD[traj]          # (T, n_alphas)
                 dn_q_selected_action_traj.append(-f_D_stack)
                 rn_q_selected_action_traj.append(1.0 - f_D_stack)
                 dn_v_median_traj.append(-f_D_stack)
@@ -307,18 +334,18 @@ def run(config, options, data, plot_hists):
 
         value_data = data
 
+    print("Writing value_data...", flush=True)
     with open(os.path.join(params['checkpoint_fname'], "value_data"+addon+".pkl"), "wb") as f:
         pickle.dump(value_data, f)
-
     with open(os.path.join(local_storage_dir, "value_data"+addon+".pkl"), "wb") as f:
         pickle.dump(value_data, f)
 
+    print("Writing pre_flag_results...", flush=True)
     with open(os.path.join(params['checkpoint_fname'], "pre_flag_results"+addon+".pkl"), "wb") as f:
         pickle.dump(results, f)
-
-    print("writing results")
     with open(os.path.join(local_storage_dir, "pre_flag_results"+addon+".pkl"), "wb") as f:
         pickle.dump(results, f)
+    print("Done — pre_flag_results written successfully.", flush=True)
 
 
     if plot_hists:
