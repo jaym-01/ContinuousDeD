@@ -53,7 +53,7 @@ if __name__ == '__main__':
     )
 
     # Load the best performing NCDE hyperparameters and pre-trained model weights
-    ncde_params = torch.load(os.path.join(config_dict['output_dir'], 'best_model.pt'))
+    ncde_params = torch.load(os.path.join(config_dict['output_dir'], 'best_model.pt'), weights_only=False)
     ncde_hparams = ncde_params['hyperparameters']
 
     hdim = ncde_hparams['hidden_dim']

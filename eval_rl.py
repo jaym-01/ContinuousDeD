@@ -669,78 +669,118 @@ def run(config, options, data, plot_hists):
         bnd_method  = params.get('bnd_method', 'predictor_corrector')
 
         if bnd_method == 'predictor_corrector':
-            # Auto-calibrate delta_D: probe Q range so the boundary exists inside Q space.
-            # Without this, a hardcoded delta_D=-0.7 is often below all Q values → f_D=0
-            # everywhere → AUC=0.  Setting delta_D to the p-th percentile of CVaR values
-            # ensures ~p% of (state,action) pairs are in the dead-end region on average,
-            # so f_D varies between states and the flagging threshold sweep produces a
-            # proper ROC curve.
+            pc_kwargs = dict(
+                bnd_M=params.get('bnd_M', 5),
+                bnd_h0=params.get('bnd_h0', 0.05),
+                bnd_eps_tol=params.get('bnd_eps_tol', 1e-4),
+                bnd_eps_close=params.get('bnd_eps_close', 0.02),
+                bnd_eps_dup=params.get('bnd_eps_dup', 0.02),
+                bnd_eta=params.get('bnd_eta', 1.5),
+                bnd_C_max=params.get('bnd_C_max', 10),
+                bnd_num_tau=params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64)),
+                log_every_traj=params.get('eval_log_every_traj', 10),
+            )
+
+            # --- R-net: single calibration (not swept — sweeping both D and R
+            #     would require N_D × N_R full passes; the D-net provides the
+            #     primary dead-end signal so the sweep is concentrated there).
             if params.get('bnd_delta_D_auto', True):
-                delta_D_dn = _probe_q_percentile(
-                    qnet_dn, encoded_data, params,
-                    percentile=params.get('bnd_delta_D_percentile', 25),
-                    n_samples=500, alpha=float(alphas_f[0]),
-                )
                 delta_D_rn = _probe_q_percentile(
                     qnet_rn, encoded_data, params,
                     percentile=params.get('bnd_delta_R_percentile', 75),
                     n_samples=500, alpha=float(alphas_f[0]),
                 )
             else:
-                delta_D_dn = params.get('bnd_delta_D', -0.5)
-                delta_D_rn = params.get('bnd_delta_R',  0.5)
+                delta_D_rn = params.get('bnd_delta_R', 0.5)
 
-            data_by_alpha_dn = get_continuous_dead_end_data(
-                qnet_dn, encoded_data, device, params,
-                bnd_alphas=alphas_f,
-                bnd_delta_D=delta_D_dn,
-                bnd_M=params.get('bnd_M', 5),
-                bnd_h0=params.get('bnd_h0', 0.05),
-                bnd_eps_tol=params.get('bnd_eps_tol', 1e-4),
-                bnd_eps_close=params.get('bnd_eps_close', 0.02),
-                bnd_eps_dup=params.get('bnd_eps_dup', 0.02),
-                bnd_eta=params.get('bnd_eta', 1.5),
-                bnd_C_max=params.get('bnd_C_max', 10),
-                bnd_num_tau=params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64)),
-                checkpoint_path=os.path.join(params['checkpoint_fname'], f'pc_dn_ckpt{addon}.pkl'),
-                log_every_traj=params.get('eval_log_every_traj', 10),
-            )
             data_by_alpha_rn = get_continuous_dead_end_data(
                 qnet_rn, encoded_data, device, params,
                 bnd_alphas=alphas_f,
                 bnd_delta_D=delta_D_rn,
-                bnd_M=params.get('bnd_M', 5),
-                bnd_h0=params.get('bnd_h0', 0.05),
-                bnd_eps_tol=params.get('bnd_eps_tol', 1e-4),
-                bnd_eps_close=params.get('bnd_eps_close', 0.02),
-                bnd_eps_dup=params.get('bnd_eps_dup', 0.02),
-                bnd_eta=params.get('bnd_eta', 1.5),
-                bnd_C_max=params.get('bnd_C_max', 10),
-                bnd_num_tau=params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64)),
                 checkpoint_path=os.path.join(params['checkpoint_fname'], f'pc_rn_ckpt{addon}.pkl'),
-                log_every_traj=params.get('eval_log_every_traj', 10),
+                **pc_kwargs,
             )
 
-            # Merge D-network and R-network DataFrames: v_dn from D-net, v_rn from R-net.
-            # get_continuous_dead_end_data writes both v_dn=-f_D and v_rn=1-f_D using
-            # only the one network it was passed — so v_rn from the D-net call is wrong.
-            # We overwrite it here with 1 - f_R where f_R comes from the R-net call.
-            merged_by_alpha = {}
-            for alpha in alphas_f:
-                cols_dn  = ['traj', 'step', 'f_D', 'v_dn', 'category', 'stay_id']
-                cols_rn  = ['traj', 'step', 'f_D']
-                df_dn    = data_by_alpha_dn[alpha][cols_dn].copy()
-                df_rn    = data_by_alpha_rn[alpha][cols_rn].rename(columns={'f_D': 'f_R'})
-                merged   = df_dn.merge(df_rn, on=['traj', 'step'])
-                merged['v_rn'] = 1.0 - merged['f_R']
-                merged_by_alpha[alpha] = merged
+            # --- D-net: sweep percentiles, pick the delta_D that maximises AUC.
+            # Each candidate runs the full predictor-corrector on all test
+            # trajectories; results are assembled and scored inline so we only
+            # keep the best set of v_dn/v_rn arrays.
+            sweep_percentiles = params.get('bnd_delta_D_sweep_percentiles', [10, 25, 40, 50, 60, 75])
+            if not params.get('bnd_delta_D_auto', True):
+                # Auto disabled: treat the hardcoded value as the single candidate.
+                sweep_percentiles = [None]
 
-            results = _assemble_pc_results(merged_by_alpha, alphas_f)
+            best_auc          = -1.0
+            best_delta_D_dn   = None
+            best_results      = None
+            auc_by_percentile = {}
+
+            print(
+                f"\nSweeping delta_D over percentiles {sweep_percentiles} "
+                f"(R-net fixed at delta_D_rn={delta_D_rn:.4f})...",
+                flush=True,
+            )
+
+            def _merge_results(data_dn, data_rn, alphas_f):
+                merged = {}
+                for alpha in alphas_f:
+                    cols_dn = ['traj', 'step', 'f_D', 'v_dn', 'category', 'stay_id']
+                    df_dn   = data_dn[alpha][cols_dn].copy()
+                    df_rn   = data_rn[alpha][['traj', 'step', 'f_D']].rename(columns={'f_D': 'f_R'})
+                    m       = df_dn.merge(df_rn, on=['traj', 'step'])
+                    m['v_rn'] = 1.0 - m['f_R']
+                    merged[alpha] = m
+                return merged
+
+            for pct in sweep_percentiles:
+                if pct is None:
+                    delta_D_dn = params.get('bnd_delta_D', -0.5)
+                    pct_label  = 'fixed'
+                else:
+                    delta_D_dn = _probe_q_percentile(
+                        qnet_dn, encoded_data, params,
+                        percentile=pct, n_samples=500, alpha=float(alphas_f[0]),
+                    )
+                    pct_label = f'p{pct}'
+
+                data_by_alpha_dn = get_continuous_dead_end_data(
+                    qnet_dn, encoded_data, device, params,
+                    bnd_alphas=alphas_f,
+                    bnd_delta_D=delta_D_dn,
+                    checkpoint_path=os.path.join(
+                        params['checkpoint_fname'], f'pc_dn_{pct_label}_ckpt{addon}.pkl'
+                    ),
+                    **pc_kwargs,
+                )
+
+                cand_results = _assemble_pc_results(
+                    _merge_results(data_by_alpha_dn, data_by_alpha_rn, alphas_f), alphas_f
+                )
+                auc = _quick_auc(cand_results)
+                auc_by_percentile[pct_label] = {'delta_D': delta_D_dn, 'auc': auc}
+                print(f"  delta_D {pct_label} = {delta_D_dn:.4f}  →  AUC = {auc:.4f}", flush=True)
+
+                if auc > best_auc:
+                    best_auc        = auc
+                    best_delta_D_dn = delta_D_dn
+                    best_results    = cand_results
+
+            best_label = max(auc_by_percentile, key=lambda k: auc_by_percentile[k]['auc'])
+            print(
+                f"\nBest delta_D: {best_label} = {best_delta_D_dn:.4f}  (AUC = {best_auc:.4f})",
+                flush=True,
+            )
+            print("AUC sweep summary:", flush=True)
+            for lbl, v in auc_by_percentile.items():
+                print(f"  {lbl}: delta_D={v['delta_D']:.4f}  AUC={v['auc']:.4f}", flush=True)
+
+            results    = best_results
             value_data = {
-                'alpha': alpha_sweep,
-                'delta_D_dn': delta_D_dn,
-                'delta_D_rn': delta_D_rn,
-                'results': results,
+                'alpha':             alpha_sweep,
+                'delta_D_dn':        best_delta_D_dn,
+                'delta_D_rn':        delta_D_rn,
+                'results':           results,
+                'auc_sweep':         auc_by_percentile,
             }
 
         else:  # 'grid_cvar' — fast approximation, no delta_D needed

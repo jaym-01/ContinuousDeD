@@ -70,6 +70,7 @@ bnd_method: predictor_corrector
 bnd_delta_D_auto: True
 bnd_delta_D_percentile: 25   # p-th percentile for D-network (Q_D ∈ [-1,0])
 bnd_delta_R_percentile: 75   # p-th percentile for R-network (Q_R ∈ [0,1])
+bnd_delta_D_sweep_percentiles: [10, 25, 40, 50, 60, 75]  # D-net sweep; best AUC is kept
 
 # Fallback fixed thresholds used only when bnd_delta_D_auto=False
 bnd_delta_D: -0.7
