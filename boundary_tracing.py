@@ -286,6 +286,131 @@ def _action_space_area(action_low, action_high):
 # Public API
 # ---------------------------------------------------------------------------
 
+def dead_end_volume_fraction_grid_batch(
+    states,
+    agent_dn,
+    alphas,
+    delta_D=-0.5,
+    M=10,
+    action_low=None,
+    action_high=None,
+    num_tau=64,
+):
+    """Grid-based f_D estimate for a batch of states — one forward pass for all.
+
+    For N states and an M×M action grid, runs one forward pass of size N×M²,
+    then computes CVaR at each alpha level from cached quantiles.
+
+    Parameters
+    ----------
+    states : (N, state_dim) numpy array or GPU tensor
+
+    Returns
+    -------
+    f_D : (N, len(alphas)) numpy array — f_D[i, j] for state i, alpha alphas[j]
+    """
+    device     = agent_dn.device
+    action_dim = agent_dn.action_dim
+
+    if action_low is None:
+        action_low  = [0.0] * action_dim
+    if action_high is None:
+        action_high = [1.0] * action_dim
+
+    states_t = torch.as_tensor(np.asarray(states, dtype=np.float32), device=device)
+    N = states_t.shape[0]
+
+    a_lo_t = torch.as_tensor(np.asarray(action_low,  np.float32), device=device)
+    a_hi_t = torch.as_tensor(np.asarray(action_high, np.float32), device=device)
+
+    ax0 = torch.linspace(float(a_lo_t[0]), float(a_hi_t[0]), M, device=device)
+    ax1 = torch.linspace(float(a_lo_t[1]), float(a_hi_t[1]), M, device=device)
+    G0, G1 = torch.meshgrid(ax0, ax1, indexing='ij')
+    grid_t = torch.stack([G0.reshape(-1), G1.reshape(-1)], dim=1)  # (M², 2)
+    A = grid_t.shape[0]  # M²
+
+    # Expand: each state paired with every action → (N×M², state_dim/action_dim)
+    states_exp  = states_t.unsqueeze(1).expand(N, A, -1).reshape(N * A, -1)
+    actions_exp = grid_t.unsqueeze(0).expand(N, A, -1).reshape(N * A, -1)
+
+    agent_dn.eval()
+    with torch.no_grad():
+        quantiles, _ = agent_dn.network(states_exp, actions_exp, num_tau)  # (N*A, num_tau, 1)
+
+    sorted_q = quantiles.squeeze(-1).sort(dim=1)[0].reshape(N, A, num_tau)  # (N, A, num_tau)
+
+    alphas = list(alphas)
+    f_D = np.empty((N, len(alphas)), dtype=np.float32)
+    for j, alpha in enumerate(alphas):
+        k = max(1, round(alpha * num_tau))
+        cvar = sorted_q[:, :, :k].mean(dim=2)  # (N, A)
+        g = cvar - delta_D                      # (N, A)
+        # g < 0 ↔ CVaR_alpha(Q_D) < delta_D — the dead-end region.
+        # The predictor-corrector traces the g=0 boundary CCW, enclosing g < 0,
+        # so f_D = fraction of dead-end actions = fraction where g < 0.
+        f_D[:, j] = (g < 0).float().mean(dim=1).cpu().numpy()
+
+    return f_D
+
+
+def dead_end_volume_fraction_grid(
+    state,
+    agent_dn,
+    alphas,
+    delta_D=-0.5,
+    M=10,
+    action_low=None,
+    action_high=None,
+    num_tau=64,
+):
+    """Fast grid-based estimate of f_D for multiple alpha levels.
+
+    Replaces the predictor-corrector boundary tracer with a single batched
+    forward pass over an M×M action grid.  f_D is the fraction of grid cells
+    where g(s,a) = CVaR_alpha(Q_D(s,a)) - delta_D > 0.
+
+    One forward pass is shared across all alpha values (quantiles are computed
+    once; CVaR is sliced per alpha).  Complexity: O(1) network calls vs the
+    tracer's O(max_steps × C_max) sequential calls per state.
+
+    Parameters
+    ----------
+    alphas : sequence of float
+    M      : int — grid side length; M=10 gives 100 actions per forward pass
+
+    Returns
+    -------
+    dict {float(alpha): float f_D}
+    """
+    device     = agent_dn.device
+    action_dim = agent_dn.action_dim
+
+    if action_low is None:
+        action_low  = [0.0] * action_dim
+    if action_high is None:
+        action_high = [1.0] * action_dim
+
+    state_t = torch.tensor(state[None], dtype=torch.float32, device=device)
+
+    a_lo_t = torch.as_tensor(np.asarray(action_low,  np.float32), device=device)
+    a_hi_t = torch.as_tensor(np.asarray(action_high, np.float32), device=device)
+
+    ax0 = torch.linspace(float(a_lo_t[0]), float(a_hi_t[0]), M, device=device)
+    ax1 = torch.linspace(float(a_lo_t[1]), float(a_hi_t[1]), M, device=device)
+    G0, G1 = torch.meshgrid(ax0, ax1, indexing='ij')
+    grid_t = torch.stack([G0.reshape(-1), G1.reshape(-1)], dim=1)  # (M*M, 2)
+
+    agent_dn.eval()
+    sorted_q = _eval_quantiles_batch(state_t, grid_t, agent_dn, num_tau)  # (M*M, num_tau)
+
+    result = {}
+    for alpha in alphas:
+        g_vals = _cvar_from_quantiles(sorted_q, alpha, delta_D)  # (M*M,)
+        result[float(alpha)] = float((g_vals < 0).float().mean())
+
+    return result
+
+
 def dead_end_volume_fraction(
     state,
     agent_dn,
@@ -350,7 +475,9 @@ def dead_end_volume_fraction(
                 dtype=torch.float32, device=device
             ).unsqueeze(0)
             g_mid = _eval_g_batch(state_t, mid_t, agent_dn, delta_D, alpha, num_tau).item()
-            f_D = 1.0 if g_mid > 0 else 0.0
+            # g < 0 everywhere → whole action space is dead-end → f_D = 1
+            # g > 0 everywhere → no dead-end actions → f_D = 0
+            f_D = 0.0 if g_mid > 0 else 1.0
             return f_D, []
 
         # Phase 2: predictor-corrector tracing
@@ -500,7 +627,7 @@ def dead_end_volume_fraction_multi_alpha(
                     dtype=torch.float32, device=device,
                 ).unsqueeze(0)
                 g_mid = _eval_g_batch(state_t, mid_t, agent_dn, delta_D, alpha, num_tau).item()
-                f_D_per_alpha[float(alpha)] = 1.0 if g_mid > 0 else 0.0
+                f_D_per_alpha[float(alpha)] = 0.0 if g_mid > 0 else 1.0
                 continue
 
             claimed = [False] * len(seeds)
