@@ -53,6 +53,13 @@ saving_period: 1    # validate and checkpoint every epoch
 checkpoint_fname: "runs/iqn_continuous_mimic/"
 
 # ------------------------------------------------------------------
+# Evaluation (grid-based dead-end detection)
+# ------------------------------------------------------------------
+bnd_delta_D: -0.7   # Q_D threshold: actions with CVaR_α(Q_D) < -0.7 are dead-end
+bnd_delta_R: 0.5    # Q_R threshold: actions with CVaR_α(Q_R) < 0.5 are non-recovery
+bnd_M: 10           # grid side length (M×M actions per state)
+
+# ------------------------------------------------------------------
 # Misc
 # ------------------------------------------------------------------
 combined: False     # if True, train a single net on both +/- rewards

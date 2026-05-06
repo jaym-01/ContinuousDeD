@@ -16,7 +16,7 @@ import torch
 from rl_utils import DQN_Agent, IQN_Agent, ContinuousIQN_OfflineAgent
 from plot_utils import plot_value_hists
 from analysis_utils import get_dn_rn_info, create_analysis_df
-from boundary_tracing import dead_end_volume_fraction_multi_alpha
+from boundary_tracing import dead_end_volume_fraction_multi_alpha, dead_end_volume_fraction_grid_batch
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
@@ -240,6 +240,101 @@ def get_continuous_dead_end_data(
 
     return {a: pd.DataFrame(rows) for a, rows in rows_by_alpha.items()}
 
+def get_continuous_dead_end_data_grid(
+    qnet_dn,
+    qnet_rn,
+    encoded_data,
+    device,
+    params,
+    alphas,
+    delta_D=-0.7,
+    delta_R=0.5,
+    M=10,
+    log_every_traj=10,
+):
+    """Grid-based dead-end detection for continuous action-space IQN.
+
+    For each state computes:
+      f_D = fraction of M×M grid actions where CVaR_α(Q_D) < delta_D
+      f_R = fraction of M×M grid actions where CVaR_α(Q_R) < delta_R
+
+    Then stores v_dn = -f_D  and  v_rn = 1 - f_R, giving independent
+    D and R signals for the downstream flag condition.
+
+    Returns
+    -------
+    data_by_alpha : dict {alpha: pd.DataFrame}
+        Columns: traj, step, f_D, f_R, v_dn, v_rn, category, stay_id
+    """
+    n_total    = len(encoded_data['states'])
+    action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
+    action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
+    alphas_f   = [float(a) for a in alphas]
+    num_tau    = params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64))
+
+    n_valid = sum(
+        1 for i in range(n_total)
+        if float(encoded_data['rewards'][i][int(encoded_data['lengths'][i].flat[0]) - 1].flat[-1])
+        in (-1.0, 1.0)
+    )
+
+    rows_by_alpha = {a: [] for a in alphas_f}
+    n_done = 0
+
+    print(
+        f"Grid dead-end detection (M={M}×{M}, {len(alphas_f)} alpha levels, "
+        f"delta_D={delta_D}, delta_R={delta_R}) — {n_valid} valid trajectories...",
+        flush=True,
+    )
+
+    for traj in range(n_total):
+        traj_len   = int(encoded_data['lengths'][traj].flat[0])
+        traj_r     = encoded_data['rewards'][traj][:traj_len]
+        terminal_r = float(traj_r[-1].flat[-1])
+        if terminal_r not in (-1.0, 1.0):
+            continue
+
+        category = -1 if terminal_r < 0 else 1
+        traj_sid = encoded_data['stay_ids'][traj]
+        states   = encoded_data['states'][traj][:traj_len]  # (T, state_dim)
+
+        # Single batched forward pass per network for all T states × M² actions
+        fD = dead_end_volume_fraction_grid_batch(
+            states, qnet_dn, alphas_f,
+            delta_D=delta_D, M=M,
+            action_low=action_low, action_high=action_high,
+            num_tau=num_tau,
+        )  # (T, n_alphas)
+
+        fR = dead_end_volume_fraction_grid_batch(
+            states, qnet_rn, alphas_f,
+            delta_D=delta_R, M=M,
+            action_low=action_low, action_high=action_high,
+            num_tau=num_tau,
+        )  # (T, n_alphas)
+
+        for j, alpha in enumerate(alphas_f):
+            for t in range(traj_len):
+                f_d = float(fD[t, j])
+                f_r = float(fR[t, j])
+                rows_by_alpha[alpha].append({
+                    'traj':     traj,
+                    'step':     t,
+                    'f_D':      f_d,
+                    'f_R':      f_r,
+                    'v_dn':     -f_d,
+                    'v_rn':     1.0 - f_r,
+                    'category': category,
+                    'stay_id':  traj_sid,
+                })
+
+        n_done += 1
+        if log_every_traj and (n_done % log_every_traj == 0):
+            print(f"  {n_done}/{n_valid} trajectories processed", flush=True)
+
+    return {a: pd.DataFrame(rows) for a, rows in rows_by_alpha.items()}
+
+
 #############################
 ##     MAIN EXECUTOR
 #############################
@@ -339,40 +434,34 @@ def run(config, options, data, plot_hists):
     if continuous:
         alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
         alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
-        ckpt_path = os.path.join(params['checkpoint_fname'], f"eval_checkpoint_{data}.pkl")
-        data_by_alpha = get_continuous_dead_end_data(
+        data_by_alpha = get_continuous_dead_end_data_grid(
             qnet_dn,
+            qnet_rn,
             encoded_data,
             device,
             params,
-            bnd_M=params.get('bnd_M', 20),
-            bnd_alphas=[float(a) for a in alpha_sweep],
-            bnd_delta_D=params.get('bnd_delta_D', -0.5),
-            bnd_h0=params.get('bnd_h0', 0.05),
-            bnd_eps_tol=params.get('bnd_eps_tol', 1e-4),
-            bnd_eps_close=params.get('bnd_eps_close', 0.02),
-            bnd_eps_dup=params.get('bnd_eps_dup', 0.02),
-            bnd_eta=params.get('bnd_eta', 1.5),
-            bnd_C_max=params.get('bnd_C_max', 10),
-            bnd_num_tau=params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64)),
-            checkpoint_path=ckpt_path,
-            checkpoint_every=params.get('eval_checkpoint_every', 100),
+            alphas=[float(a) for a in alpha_sweep],
+            delta_D=params.get('bnd_delta_D', -0.7),
+            delta_R=params.get('bnd_delta_R', 0.5),
+            M=params.get('bnd_M', 10),
             log_every_traj=params.get('eval_log_every_traj', 10),
-            log_every_state=params.get('eval_log_every_state', 0),
         )
 
         alphas_f = [float(a) for a in alpha_sweep]
 
-        # Build {traj_id: (T, n_alphas) f_D array} with one groupby per alpha
-        # instead of O(n_trajs × n_alphas) per-trajectory DataFrame filters.
-        print("Building per-trajectory f_D lookup...", flush=True)
+        print("Building per-trajectory f_D / f_R lookups...", flush=True)
         traj_to_fD = {}
+        traj_to_fR = {}
         for j, alpha in enumerate(alphas_f):
             for traj_id, grp in data_by_alpha[alpha].groupby('traj'):
-                fD_vec = grp.sort_values('step').f_D.values.astype(np.float32)
+                grp_sorted = grp.sort_values('step')
+                fD_vec = grp_sorted.f_D.values.astype(np.float32)
+                fR_vec = grp_sorted.f_R.values.astype(np.float32)
                 if traj_id not in traj_to_fD:
                     traj_to_fD[traj_id] = np.zeros((len(fD_vec), len(alphas_f)), dtype=np.float32)
+                    traj_to_fR[traj_id] = np.zeros((len(fD_vec), len(alphas_f)), dtype=np.float32)
                 traj_to_fD[traj_id][:, j] = fD_vec
+                traj_to_fR[traj_id][:, j] = fR_vec
 
         first_alpha = alphas_f[0]
         data_ref = data_by_alpha[first_alpha]
@@ -394,11 +483,12 @@ def run(config, options, data, plot_hists):
                 d_ref_traj = data_ref[data_ref.traj == traj]
                 sid_traj.append(d_ref_traj.stay_id.iloc[0])
 
-                f_D_stack = traj_to_fD[traj]          # (T, n_alphas)
+                f_D_stack = traj_to_fD[traj]  # (T, n_alphas)
+                f_R_stack = traj_to_fR[traj]  # (T, n_alphas)
                 dn_q_selected_action_traj.append(-f_D_stack)
-                rn_q_selected_action_traj.append(1.0 - f_D_stack)
+                rn_q_selected_action_traj.append(1.0 - f_R_stack)
                 dn_v_median_traj.append(-f_D_stack)
-                rn_v_median_traj.append(1.0 - f_D_stack)
+                rn_v_median_traj.append(1.0 - f_R_stack)
 
             results[traj_type]["dn_q_selected_action_traj"] = dn_q_selected_action_traj
             results[traj_type]["rn_q_selected_action_traj"] = rn_q_selected_action_traj
