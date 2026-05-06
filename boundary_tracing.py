@@ -20,64 +20,97 @@ import numpy as np
 import torch
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# GPU-native helpers
 # ---------------------------------------------------------------------------
 
-def _compute_g_and_grad(state_t, action_np, agent_dn, delta_D, alpha, num_tau):
-    """Evaluate g(s,a) and ∇_a g(s,a).
+def _eval_quantiles_batch(state_t, actions_t, agent_dn, num_tau):
+    """Forward-only batch: return sorted quantiles for a batch of actions.
 
-    Parameters
-    ----------
-    state_t   : (1, state_dim) float tensor on agent device, no grad needed
-    action_np : (action_dim,) numpy array
-    agent_dn  : ContinuousIQN_OfflineAgent
-    delta_D   : float, dead-end threshold (e.g. -0.5 for D-net in [-1,0])
-    alpha     : float, CVaR level in (0, 1]
-    num_tau   : int, quantile samples
+    state_t   : (1, state_dim) GPU tensor
+    actions_t : (B, action_dim) GPU tensor
+    Returns   : sorted_q (B, num_tau) float32 tensor on the same device
+    """
+    B = actions_t.shape[0]
+    state_exp = state_t.expand(B, -1)
+    with torch.no_grad():
+        quantiles, _ = agent_dn.network(state_exp, actions_t, num_tau)  # (B, num_tau, 1)
+    return quantiles.squeeze(-1).sort(dim=1)[0]  # (B, num_tau)
+
+
+def _eval_g_batch(state_t, actions_t, agent_dn, delta_D, alpha, num_tau):
+    """Forward-only batch evaluation of g(s, a) — no gradient, no backward.
+
+    state_t   : (1, state_dim) GPU tensor
+    actions_t : (B, action_dim) GPU tensor
+    Returns   : g_vals (B,) float32 tensor on the same device
+    """
+    k = max(1, round(alpha * num_tau))
+    sorted_q = _eval_quantiles_batch(state_t, actions_t, agent_dn, num_tau)
+    cvar = sorted_q[:, :k].mean(dim=1)
+    return cvar - delta_D
+
+
+def _cvar_from_quantiles(sorted_q, alpha, delta_D):
+    """Compute g = CVaR_alpha - delta_D from pre-sorted quantiles.
+
+    sorted_q : (B, num_tau) tensor
+    Returns  : (B,) tensor
+    """
+    k = max(1, round(alpha * sorted_q.shape[1]))
+    return sorted_q[:, :k].mean(dim=1) - delta_D
+
+
+def _compute_g_and_grad(state_t, action_t, agent_dn, delta_D, alpha, num_tau):
+    """Evaluate g(s,a) and ∇_a g(s,a), keeping tensors on GPU.
+
+    action_t must be a (1, action_dim) GPU tensor with requires_grad=True
+    (created fresh each call so the graph is clean).
 
     Returns
     -------
     g_val  : float
-    grad_a : (action_dim,) numpy array  — ∇_a g
+    grad_a : (action_dim,) GPU tensor (detached)
     """
-    device = agent_dn.device
-    action_t = torch.tensor(
-        action_np[None], dtype=torch.float32, device=device, requires_grad=True
-    )
-
     quantiles, _ = agent_dn.network(state_t, action_t, num_tau)  # (1, num_tau, 1)
-    quantiles_sorted = quantiles.squeeze().sort()[0]              # (num_tau,)
-
     k = max(1, round(alpha * num_tau))
-    cvar = quantiles_sorted[:k].mean()
+    cvar = quantiles.squeeze(-1).sort(dim=1)[0][0, :k].mean()
     g = cvar - delta_D
-
     g.backward()
-    grad_a = action_t.grad.detach().cpu().numpy().ravel()
-    return g.item(), grad_a
+    return g.item(), action_t.grad.detach().squeeze(0)  # (action_dim,)
 
 
-def _bisect_to_boundary(a0, a1, g0, state_t, agent_dn, delta_D, alpha, num_tau, eps_tol, max_iter=50):
-    """Binary search along edge [a0, a1] for a* with |g(s,a*)| < eps_tol.
+# ---------------------------------------------------------------------------
+# Bisection (forward-only — no gradient needed)
+# ---------------------------------------------------------------------------
 
-    Assumes g0 = g(a0) and g1 = g(a1) have opposite signs.
+def _bisect_to_boundary(a0_t, a1_t, g0, state_t, agent_dn, delta_D, alpha,
+                        num_tau, eps_tol, max_iter=50):
+    """Binary search along [a0_t, a1_t] for a* with |g(s,a*)| < eps_tol.
+
+    a0_t, a1_t : (1, action_dim) GPU tensors
+    g0         : float — g(a0) (pre-computed, sign known)
+    Returns    : (1, action_dim) GPU tensor
     """
-    g1, _ = _compute_g_and_grad(state_t, a1, agent_dn, delta_D, alpha, num_tau)
+    g1 = _eval_g_batch(state_t, a1_t, agent_dn, delta_D, alpha, num_tau).item()
     for _ in range(max_iter):
-        amid = 0.5 * (a0 + a1)
-        gmid, _ = _compute_g_and_grad(state_t, amid, agent_dn, delta_D, alpha, num_tau)
+        amid_t = 0.5 * (a0_t + a1_t)
+        gmid = _eval_g_batch(state_t, amid_t, agent_dn, delta_D, alpha, num_tau).item()
         if abs(gmid) < eps_tol:
-            return amid
+            return amid_t
         if gmid * g0 < 0:
-            a1, g1 = amid, gmid
+            a1_t, g1 = amid_t, gmid
         else:
-            a0, g0 = amid, gmid
-    return 0.5 * (a0 + a1)
+            a0_t, g0 = amid_t, gmid
+    return 0.5 * (a0_t + a1_t)
 
 
-def _rotate90(v):
-    """Rotate 2-D vector 90° counter-clockwise."""
-    return np.array([-v[1], v[0]])
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+def _rotate90_t(v_t):
+    """Rotate a (action_dim,) GPU tensor 90° counter-clockwise."""
+    return torch.stack([-v_t[1], v_t[0]])
 
 
 def _shoelace_area(polygon):
@@ -88,146 +121,153 @@ def _shoelace_area(polygon):
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Seed detection
+# Phase 1: Seed detection (GPU-batched grid scan)
 # ---------------------------------------------------------------------------
 
 def _phase1_seeds(state_t, agent_dn, delta_D, alpha, M, action_low, action_high,
                   eps_tol, eps_dup, num_tau):
-    """Return a list of (action_dim,) seed points on the g=0 boundary."""
-    a_lo = np.asarray(action_low, dtype=np.float32)
-    a_hi = np.asarray(action_high, dtype=np.float32)
+    """Return a list of (action_dim,) numpy seed points on the g=0 boundary."""
+    device = agent_dn.device
+    a_lo_np = np.asarray(action_low, dtype=np.float32)
+    a_hi_np = np.asarray(action_high, dtype=np.float32)
+    a_lo_t  = torch.as_tensor(a_lo_np, device=device)
+    a_hi_t  = torch.as_tensor(a_hi_np, device=device)
 
-    # Build M×M grid over 2-D action space
-    ax0 = np.linspace(a_lo[0], a_hi[0], M)
-    ax1 = np.linspace(a_lo[1], a_hi[1], M)
-    G0, G1 = np.meshgrid(ax0, ax1, indexing='ij')              # (M, M)
-    grid = np.stack([G0, G1], axis=-1).reshape(-1, 2)          # (M*M, 2)
+    # Build M×M grid on GPU
+    ax0 = torch.linspace(float(a_lo_t[0]), float(a_hi_t[0]), M, device=device)
+    ax1 = torch.linspace(float(a_lo_t[1]), float(a_hi_t[1]), M, device=device)
+    G0, G1 = torch.meshgrid(ax0, ax1, indexing='ij')
+    grid_t = torch.stack([G0.reshape(-1), G1.reshape(-1)], dim=1)  # (M*M, 2)
 
-    # --- Evaluate g and ∇g on every grid vertex ---
-    g_vals = np.zeros(len(grid), dtype=np.float32)
-    grad_vals = np.zeros((len(grid), 2), dtype=np.float32)
-    for idx, a in enumerate(grid):
-        gv, gd = _compute_g_and_grad(state_t, a, agent_dn, delta_D, alpha, num_tau)
-        g_vals[idx] = gv
-        grad_vals[idx] = gd
-    g_grid = g_vals.reshape(M, M)
+    # ---- Single batched forward pass for all grid g-values ----
+    g_vals_t = _eval_g_batch(state_t, grid_t, agent_dn, delta_D, alpha, num_tau)
+    g_vals   = g_vals_t.cpu().numpy()
+    g_grid   = g_vals.reshape(M, M)
+
+    ax0_np = ax0.cpu().numpy()
+    ax1_np = ax1.cpu().numpy()
 
     seeds = []
 
-    def _add_seed(a_star):
-        """Add seed if not a duplicate."""
+    def _add_seed(a_t):
+        a_np = a_t.squeeze(0).cpu().numpy()
         for s in seeds:
-            if np.linalg.norm(a_star - s) < eps_dup:
+            if np.linalg.norm(a_np - s) < eps_dup:
                 return
-        # Clamp to action box
-        a_clamped = np.clip(a_star, a_lo, a_hi)
-        seeds.append(a_clamped)
-
-    # --- Sign-change edges → bisection ---
-    delta_grid = (a_hi - a_lo) / (M - 1)  # per-axis cell width
+        seeds.append(np.clip(a_np, a_lo_np, a_hi_np))
 
     def _grid_pt(i, j):
-        return np.array([ax0[i], ax1[j]], dtype=np.float32)
+        return torch.tensor([[ax0_np[i], ax1_np[j]]], dtype=torch.float32, device=device)
 
+    # Sign-change edges → bisection (forward-only on GPU)
     for i in range(M):
         for j in range(M):
-            idx_ij = i * M + j
             g_ij = g_grid[i, j]
-            # Horizontal edge to (i+1, j)
-            if i + 1 < M:
-                g_next = g_grid[i + 1, j]
-                if g_ij * g_next < 0:
-                    a_star = _bisect_to_boundary(
-                        _grid_pt(i, j), _grid_pt(i + 1, j), g_ij,
-                        state_t, agent_dn, delta_D, alpha, num_tau, eps_tol
-                    )
-                    _add_seed(a_star)
-            # Vertical edge to (i, j+1)
-            if j + 1 < M:
-                g_next = g_grid[i, j + 1]
-                if g_ij * g_next < 0:
-                    a_star = _bisect_to_boundary(
-                        _grid_pt(i, j), _grid_pt(i, j + 1), g_ij,
-                        state_t, agent_dn, delta_D, alpha, num_tau, eps_tol
-                    )
-                    _add_seed(a_star)
+            if i + 1 < M and g_ij * g_grid[i + 1, j] < 0:
+                a_star = _bisect_to_boundary(
+                    _grid_pt(i, j), _grid_pt(i + 1, j), g_ij,
+                    state_t, agent_dn, delta_D, alpha, num_tau, eps_tol
+                )
+                _add_seed(a_star)
+            if j + 1 < M and g_ij * g_grid[i, j + 1] < 0:
+                a_star = _bisect_to_boundary(
+                    _grid_pt(i, j), _grid_pt(i, j + 1), g_ij,
+                    state_t, agent_dn, delta_D, alpha, num_tau, eps_tol
+                )
+                _add_seed(a_star)
 
-    # --- Near-boundary vertices → gradient Newton step ---
-    delta_thresh = np.linalg.norm(delta_grid) * np.sqrt(2) / 2  # δ_grid √2 / 2
-    for idx, (a, gv, gd) in enumerate(zip(grid, g_vals, grad_vals)):
-        norm_gd = np.linalg.norm(gd)
+    # Near-boundary vertices → gradient Newton step.
+    # Only compute gradients for candidates where |g| is small enough to plausibly
+    # satisfy |g|/|∇g| < delta_thresh (avoids unnecessary backward passes).
+    delta_grid_np = (a_hi_np - a_lo_np) / (M - 1)
+    delta_thresh  = float(np.linalg.norm(delta_grid_np)) * np.sqrt(2) / 2
+    g_abs_max     = float(np.abs(g_vals).max()) + 1e-12
+    # Loose prefilter: skip points where |g| > 5× delta_thresh (gradient would have
+    # to be implausibly small to satisfy the condition).
+    candidate_mask = np.abs(g_vals) < max(5.0 * delta_thresh, 0.1 * g_abs_max)
+
+    for idx in np.where(candidate_mask)[0]:
+        gv = float(g_vals[idx])
+        a_t = grid_t[idx : idx + 1].clone().requires_grad_(True)
+        _, gd_t = _compute_g_and_grad(state_t, a_t, agent_dn, delta_D, alpha, num_tau)
+        # gd_t : (action_dim,)
+        norm_gd = float(gd_t.norm())
         if norm_gd < 1e-12:
             continue
         if abs(gv) / norm_gd < delta_thresh:
-            a_star = a - (gv / (norm_gd ** 2)) * gd
-            a_star = np.clip(a_star, a_lo, a_hi)
-            _add_seed(a_star)
+            a_star_t = a_t.detach().squeeze(0) - (gv / norm_gd ** 2) * gd_t  # (action_dim,)
+            a_star_t = torch.clamp(a_star_t, a_lo_t, a_hi_t)
+            _add_seed(a_star_t)
 
     return seeds
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Predictor-corrector tracing
+# Phase 2: Predictor-corrector tracing (GPU-native inner loop)
 # ---------------------------------------------------------------------------
 
-def _phase2_trace(seed, state_t, agent_dn, delta_D, alpha, h0, eps_tol,
+def _phase2_trace(seed_np, state_t, agent_dn, delta_D, alpha, h0, eps_tol,
                   eps_close, eta, C_max, action_low, action_high, num_tau,
                   max_steps=2000):
-    """Trace one connected boundary component starting from *seed*.
+    """Trace one connected boundary component starting from *seed_np*.
 
-    Returns a (N, 2) numpy array of boundary points (the polygon).
+    Returns a (N, 2) numpy array of boundary points.
     """
-    a_lo = np.asarray(action_low, dtype=np.float32)
-    a_hi = np.asarray(action_high, dtype=np.float32)
+    device = agent_dn.device
+    a_lo_t = torch.as_tensor(np.asarray(action_low, np.float32), device=device)
+    a_hi_t = torch.as_tensor(np.asarray(action_high, np.float32), device=device)
+    a_lo_np = a_lo_t.cpu().numpy()
+    a_hi_np = a_hi_t.cpu().numpy()
 
-    polygon = [seed.copy()]
-    a_k = seed.copy()
+    seed_t = torch.tensor(seed_np, dtype=torch.float32, device=device)
+    polygon_gpu = [seed_t.clone()]
+    a_k = seed_t.clone()
     h = h0
 
     for _ in range(max_steps):
-        _, grad_k = _compute_g_and_grad(state_t, a_k, agent_dn, delta_D, alpha, num_tau)
-        norm_grad = np.linalg.norm(grad_k)
+        a_in = a_k.unsqueeze(0).clone().requires_grad_(True)
+        _, grad_k = _compute_g_and_grad(state_t, a_in, agent_dn, delta_D, alpha, num_tau)
+        # grad_k : (action_dim,) GPU tensor
+        norm_grad = float(grad_k.norm())
         if norm_grad < 1e-12:
             break
 
-        # Predictor: step along tangent direction (rotate gradient 90°)
-        tangent = _rotate90(grad_k / norm_grad)
+        # Predictor: step along tangent (90° rotation of normalised gradient)
+        tangent = _rotate90_t(grad_k / norm_grad)
         a_pred = a_k + h * tangent
 
         # Corrector: Newton steps to project back onto g=0
-        a_corr = a_pred.copy()
+        a_corr = a_pred.clone()
         c_count = 0
         for c in range(C_max):
             c_count = c + 1
+            a_corr_in = a_corr.unsqueeze(0).clone().requires_grad_(True)
             g_corr, grad_corr = _compute_g_and_grad(
-                state_t, a_corr, agent_dn, delta_D, alpha, num_tau
+                state_t, a_corr_in, agent_dn, delta_D, alpha, num_tau
             )
-            norm_gc = np.linalg.norm(grad_corr)
+            norm_gc = float(grad_corr.norm())
             if norm_gc < 1e-12:
                 break
-            a_corr = a_corr - (g_corr / (norm_gc ** 2)) * grad_corr
+            a_corr = a_corr - (g_corr / norm_gc ** 2) * grad_corr
             if abs(g_corr) < eps_tol:
                 break
 
-        a_next = a_corr
-        polygon.append(a_next.copy())
+        a_k = a_corr
+        polygon_gpu.append(a_k.clone())
 
-        # Adaptive step size: shrink if corrector ran many iterations, grow otherwise
         if c_count >= C_max:
             h = h / eta
         elif c_count <= 2:
             h = h * eta
         h = float(np.clip(h, h0 / 10, h0 * 10))
 
-        # Termination: loop closed or left action space
-        if len(polygon) > 3 and np.linalg.norm(a_next - seed) < eps_close:
+        a_k_np = a_k.cpu().numpy()
+        if len(polygon_gpu) > 3 and np.linalg.norm(a_k_np - seed_np) < eps_close:
             break
-        if np.any(a_next < a_lo - 1e-3) or np.any(a_next > a_hi + 1e-3):
+        if np.any(a_k_np < a_lo_np - 1e-3) or np.any(a_k_np > a_hi_np + 1e-3):
             break
 
-        a_k = a_next
-
-    return np.array(polygon)
+    return np.stack([p.cpu().numpy() for p in polygon_gpu], axis=0)
 
 
 # ---------------------------------------------------------------------------
@@ -298,16 +338,18 @@ def dead_end_volume_fraction(
 
     agent_dn.eval()
     with torch.enable_grad():
-        # Phase 1: seed detection
+        # Phase 1: seed detection (batched grid scan)
         seeds = _phase1_seeds(
             state_t, agent_dn, delta_D, alpha, M,
             action_low, action_high, eps_tol, eps_dup, num_tau
         )
 
         if not seeds:
-            # No boundary found — check if the entire action space is inside g>0 or g<0
-            mid = 0.5 * (np.asarray(action_low) + np.asarray(action_high))
-            g_mid, _ = _compute_g_and_grad(state_t, mid, agent_dn, delta_D, alpha, num_tau)
+            mid_t = torch.tensor(
+                [0.5 * (lo + hi) for lo, hi in zip(action_low, action_high)],
+                dtype=torch.float32, device=device
+            ).unsqueeze(0)
+            g_mid = _eval_g_batch(state_t, mid_t, agent_dn, delta_D, alpha, num_tau).item()
             f_D = 1.0 if g_mid > 0 else 0.0
             return f_D, []
 
@@ -324,7 +366,6 @@ def dead_end_volume_fraction(
             if len(polygon) < 3:
                 continue
             polygons.append(polygon)
-            # Mark seeds that fall inside this polygon as claimed
             for sj, s in enumerate(seeds):
                 if not claimed[sj]:
                     for pt in polygon:
@@ -334,10 +375,157 @@ def dead_end_volume_fraction(
 
         # Phase 3: volume fraction via Shoelace
         total_area = _action_space_area(action_low, action_high)
-        dead_area = sum(_shoelace_area(p) for p in polygons)
+        dead_area  = sum(_shoelace_area(p) for p in polygons)
         f_D = min(dead_area / total_area, 1.0)
 
     return f_D, polygons
+
+
+def dead_end_volume_fraction_multi_alpha(
+    state,
+    agent_dn,
+    alphas,
+    delta_D=-0.5,
+    M=20,
+    h0=0.05,
+    eps_tol=1e-4,
+    eps_close=0.02,
+    eps_dup=0.02,
+    eta=1.5,
+    C_max=10,
+    action_low=None,
+    action_high=None,
+    num_tau=64,
+):
+    """Compute f_D(s) for multiple CVaR levels in a single pass over the state.
+
+    The M×M grid forward pass is shared across all alpha values — quantiles are
+    computed once and CVaR is sliced per alpha, reducing network calls by len(alphas)×
+    for the grid scan.  Bisection and tracing are still done per-alpha as the
+    boundary location changes with alpha.
+
+    Parameters
+    ----------
+    alphas : sequence of float — CVaR levels to evaluate
+
+    Returns
+    -------
+    f_D_per_alpha : dict {alpha: f_D} — volume fraction for each alpha
+    """
+    device = agent_dn.device
+    action_dim = agent_dn.action_dim
+
+    if action_low is None:
+        action_low  = [0.0] * action_dim
+    if action_high is None:
+        action_high = [1.0] * action_dim
+
+    a_lo_np = np.asarray(action_low, dtype=np.float32)
+    a_hi_np = np.asarray(action_high, dtype=np.float32)
+    a_lo_t  = torch.as_tensor(a_lo_np, device=device)
+    a_hi_t  = torch.as_tensor(a_hi_np, device=device)
+
+    state_t = torch.tensor(state[None], dtype=torch.float32, device=device)
+
+    # Build M×M grid on GPU (shared across all alphas)
+    ax0 = torch.linspace(float(a_lo_t[0]), float(a_hi_t[0]), M, device=device)
+    ax1 = torch.linspace(float(a_lo_t[1]), float(a_hi_t[1]), M, device=device)
+    G0, G1 = torch.meshgrid(ax0, ax1, indexing='ij')
+    grid_t = torch.stack([G0.reshape(-1), G1.reshape(-1)], dim=1)  # (M*M, 2)
+
+    ax0_np = ax0.cpu().numpy()
+    ax1_np = ax1.cpu().numpy()
+    delta_grid_np = (a_hi_np - a_lo_np) / (M - 1)
+
+    agent_dn.eval()
+
+    # ---- Single shared grid forward pass ----
+    sorted_q = _eval_quantiles_batch(state_t, grid_t, agent_dn, num_tau)  # (M*M, num_tau)
+
+    total_area = _action_space_area(action_low, action_high)
+    f_D_per_alpha = {}
+
+    with torch.enable_grad():
+        for alpha in alphas:
+            # Compute g-values for this alpha from cached quantiles
+            g_vals_t = _cvar_from_quantiles(sorted_q, alpha, delta_D)
+            g_vals   = g_vals_t.cpu().numpy()
+            g_grid   = g_vals.reshape(M, M)
+
+            seeds = []
+            delta_thresh = float(np.linalg.norm(delta_grid_np)) * np.sqrt(2) / 2
+
+            def _add_seed(a_t):
+                a_np = a_t.detach().cpu().numpy().reshape(-1)
+                for s in seeds:
+                    if np.linalg.norm(a_np - s) < eps_dup:
+                        return
+                seeds.append(np.clip(a_np, a_lo_np, a_hi_np))
+
+            def _grid_pt(i, j):
+                return torch.tensor([[ax0_np[i], ax1_np[j]]], dtype=torch.float32, device=device)
+
+            # Sign-change edges → bisection
+            for i in range(M):
+                for j in range(M):
+                    g_ij = g_grid[i, j]
+                    if i + 1 < M and g_ij * g_grid[i + 1, j] < 0:
+                        _add_seed(_bisect_to_boundary(
+                            _grid_pt(i, j), _grid_pt(i + 1, j), g_ij,
+                            state_t, agent_dn, delta_D, alpha, num_tau, eps_tol
+                        ))
+                    if j + 1 < M and g_ij * g_grid[i, j + 1] < 0:
+                        _add_seed(_bisect_to_boundary(
+                            _grid_pt(i, j), _grid_pt(i, j + 1), g_ij,
+                            state_t, agent_dn, delta_D, alpha, num_tau, eps_tol
+                        ))
+
+            # Near-boundary Newton step (gradient only for candidates)
+            g_abs_max    = float(np.abs(g_vals).max()) + 1e-12
+            candidate_mask = np.abs(g_vals) < max(5.0 * delta_thresh, 0.1 * g_abs_max)
+            for idx in np.where(candidate_mask)[0]:
+                gv  = float(g_vals[idx])
+                a_t = grid_t[idx : idx + 1].clone().requires_grad_(True)
+                _, gd_t = _compute_g_and_grad(state_t, a_t, agent_dn, delta_D, alpha, num_tau)
+                norm_gd = float(gd_t.norm())
+                if norm_gd < 1e-12:
+                    continue
+                if abs(gv) / norm_gd < delta_thresh:
+                    a_star = a_t.detach().squeeze(0) - (gv / norm_gd ** 2) * gd_t
+                    _add_seed(torch.clamp(a_star, a_lo_t, a_hi_t))
+
+            if not seeds:
+                mid_t = torch.tensor(
+                    [0.5 * (lo + hi) for lo, hi in zip(action_low, action_high)],
+                    dtype=torch.float32, device=device,
+                ).unsqueeze(0)
+                g_mid = _eval_g_batch(state_t, mid_t, agent_dn, delta_D, alpha, num_tau).item()
+                f_D_per_alpha[float(alpha)] = 1.0 if g_mid > 0 else 0.0
+                continue
+
+            claimed = [False] * len(seeds)
+            polygons = []
+            for si, seed in enumerate(seeds):
+                if claimed[si]:
+                    continue
+                polygon = _phase2_trace(
+                    seed, state_t, agent_dn, delta_D, alpha, h0, eps_tol,
+                    eps_close, eta, C_max, action_low, action_high, num_tau
+                )
+                if len(polygon) < 3:
+                    continue
+                polygons.append(polygon)
+                for sj, s in enumerate(seeds):
+                    if not claimed[sj]:
+                        for pt in polygon:
+                            if np.linalg.norm(s - pt) < eps_dup:
+                                claimed[sj] = True
+                                break
+
+            dead_area = sum(_shoelace_area(p) for p in polygons)
+            f_D_per_alpha[float(alpha)] = min(dead_area / total_area, 1.0)
+
+    return f_D_per_alpha
 
 
 def classify_dead_end(
