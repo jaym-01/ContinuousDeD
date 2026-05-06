@@ -432,6 +432,36 @@ def _assemble_pc_results(data_by_alpha, alphas_f):
     return results
 
 
+def _quick_auc(results, alpha_idx=0, n_thr=201):
+    """Estimate AUC at one alpha level for delta_D sweep selection.
+
+    Uses flag condition: v_dn < thr-1.0 AND v_rn < thr.
+    Vectorised over all timesteps and thresholds simultaneously.
+    """
+    thresholds = np.linspace(0.0, 1.0, n_thr, dtype=np.float32)
+
+    def _ever_flagged(group):
+        flags = []
+        for vdn_arr, vrn_arr in zip(
+            results[group]['dn_q_selected_action_traj'],
+            results[group]['rn_q_selected_action_traj'],
+        ):
+            vdn = np.asarray(vdn_arr, dtype=np.float32)
+            vrn = np.asarray(vrn_arr, dtype=np.float32)
+            if vdn.ndim > 1: vdn = vdn[:, alpha_idx]
+            if vrn.ndim > 1: vrn = vrn[:, alpha_idx]
+            f = (vdn[:, None] < (thresholds[None, :] - 1.0)) & (vrn[:, None] < thresholds[None, :])
+            flags.append(f.any(axis=0))  # (n_thr,)
+        return np.stack(flags, axis=0)   # (n_traj, n_thr)
+
+    ns = _ever_flagged('nonsurvivors')
+    s  = _ever_flagged('survivors')
+    tpr = ns.mean(axis=0)
+    fpr = s.mean(axis=0)
+    idx = np.argsort(fpr)
+    return float(np.trapz(tpr[idx], fpr[idx]))
+
+
 def get_continuous_dead_end_data_grid_cvar(
     qnet_dn,
     qnet_rn,
