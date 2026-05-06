@@ -1,5 +1,6 @@
 ## IMPORTS
 import os, sys, time
+import json
 import random
 import pickle
 import click
@@ -179,6 +180,32 @@ def run(config, options):
                     neg_samples_in_minibatch=params['num_ns'], device=device)
     # Build transitions without releasing — state stats needed for continuous agent
     train_loader.make_transition_data(release=False)
+
+    meta_path = os.path.join(params['data_dir'], "encoded_meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        ncde_hidden_dim = meta.get("ncde_hidden_dim", None)
+        if ncde_hidden_dim is not None and int(ncde_hidden_dim) != int(train_loader.data_dim):
+            raise ValueError(
+                "Encoded data dimension does not match NCDE metadata. "
+                f"encoded state_dim={train_loader.data_dim}, ncde_hidden_dim={ncde_hidden_dim}. "
+                "Re-run encode_data.py with the intended NCDE model or point RL to the correct data_dir."
+            )
+        if train_loader.continuous_actions:
+            enc_action_dim = int(train_loader.encoded_actions.shape[-1])
+            cfg_action_dim = int(params.get("action_dim", enc_action_dim))
+            if enc_action_dim != cfg_action_dim:
+                raise ValueError(
+                    "Encoded action_dim does not match RL config. "
+                    f"encoded action_dim={enc_action_dim}, config action_dim={cfg_action_dim}. "
+                    "Update iqn config or regenerate encoded data."
+                )
+    else:
+        print(
+            "Warning: encoded_meta.json not found; cannot verify NCDE/RL dimensional consistency. "
+            "Re-run encode_data.py to generate metadata."
+        )
 
     params['input_dim'] = train_loader.data_dim
 
