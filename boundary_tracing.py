@@ -176,11 +176,13 @@ def _phase1_seeds(state_t, agent_dn, delta_D, alpha, M, action_low, action_high,
                 )
                 _add_seed(a_star)
 
-    # Near-boundary vertices → gradient Newton step.
-    # Only compute gradients for candidates where |g| is small enough to plausibly
-    # satisfy |g|/|∇g| < delta_thresh (avoids unnecessary backward passes).
+    # Near-boundary vertices → gradient Newton step (Algorithm 1, Phase 1).
+    # Condition: |g(s,a)| / ‖∇_a g(s,a)‖ < δ_grid·√2/2
+    # where δ_grid is the per-dimension grid spacing (max over dims for non-square grids).
+    # δ_grid·√2/2 is the half-diagonal of one grid cell, i.e. the farthest a boundary
+    # can be from a vertex and still be detected by the gradient step.
     delta_grid_np = (a_hi_np - a_lo_np) / (M - 1)
-    delta_thresh  = float(np.linalg.norm(delta_grid_np)) * np.sqrt(2) / 2
+    delta_thresh  = float(np.max(delta_grid_np)) * np.sqrt(2) / 2   # Algorithm 1 exactly
     g_abs_max     = float(np.abs(g_vals).max()) + 1e-12
     # Loose prefilter: skip points where |g| > 5× delta_thresh (gradient would have
     # to be implausibly small to satisfy the condition).
@@ -490,7 +492,7 @@ def dead_end_volume_fraction(
     agent_dn,
     delta_D=-0.5,
     alpha=0.1,
-    M=20,
+    M=5,
     h0=0.05,
     eps_tol=1e-4,
     eps_close=0.02,
@@ -587,7 +589,7 @@ def dead_end_volume_fraction_multi_alpha(
     agent_dn,
     alphas,
     delta_D=-0.5,
-    M=20,
+    M=5,
     h0=0.05,
     eps_tol=1e-4,
     eps_close=0.02,
@@ -654,7 +656,7 @@ def dead_end_volume_fraction_multi_alpha(
             g_grid   = g_vals.reshape(M, M)
 
             seeds = []
-            delta_thresh = float(np.linalg.norm(delta_grid_np)) * np.sqrt(2) / 2
+            delta_thresh = float(np.max(delta_grid_np)) * np.sqrt(2) / 2  # Algorithm 1 exactly
 
             def _add_seed(a_t):
                 a_np = a_t.detach().cpu().numpy().reshape(-1)

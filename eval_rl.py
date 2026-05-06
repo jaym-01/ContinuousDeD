@@ -335,6 +335,103 @@ def get_continuous_dead_end_data_grid(
     return {a: pd.DataFrame(rows) for a, rows in rows_by_alpha.items()}
 
 
+def _probe_q_percentile(qnet, encoded_data, params, percentile=25, n_samples=500, alpha=0.1):
+    """Sample n_samples random (state, action) pairs and return the p-th percentile of CVaR_alpha(Q).
+
+    Used to auto-calibrate delta_D so it falls inside the model's learned Q range,
+    which is necessary for the predictor-corrector to find a non-trivial boundary and
+    for f_D to vary between dead-end and recoverable states.
+    """
+    device = qnet.device
+    action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
+    action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
+    num_tau     = params.get('num_iqn_samples_est', 64)
+    n_traj      = len(encoded_data['states'])
+    rng         = np.random.RandomState(0)
+
+    states_list  = []
+    actions_list = []
+    n_collected  = 0
+    for _ in range(n_samples * 10):
+        traj = rng.randint(n_traj)
+        traj_len = int(encoded_data['lengths'][traj].flat[0])
+        if traj_len == 0:
+            continue
+        t = rng.randint(traj_len)
+        states_list.append(encoded_data['states'][traj][t])
+        a = np.array([rng.uniform(lo, hi) for lo, hi in zip(action_low, action_high)], dtype=np.float32)
+        actions_list.append(a)
+        n_collected += 1
+        if n_collected >= n_samples:
+            break
+
+    states_t  = torch.as_tensor(np.stack(states_list,  axis=0).astype(np.float32), device=device)
+    actions_t = torch.as_tensor(np.stack(actions_list, axis=0).astype(np.float32), device=device)
+
+    qnet.eval()
+    with torch.no_grad():
+        quantiles, _ = qnet.network(states_t, actions_t, num_tau)  # (N, num_tau, 1)
+    sorted_q = quantiles.squeeze(-1).sort(dim=1)[0]  # (N, num_tau)
+    k = max(1, round(alpha * num_tau))
+    cvar = sorted_q[:, :k].mean(dim=1).cpu().numpy()  # (N,)
+
+    val = float(np.percentile(cvar, percentile))
+    print(
+        f"Q-probe ({n_collected} pairs, α={alpha}): "
+        f"min={cvar.min():.4f}  p25={np.percentile(cvar,25):.4f}  "
+        f"median={np.median(cvar):.4f}  p75={np.percentile(cvar,75):.4f}  max={cvar.max():.4f}",
+        flush=True,
+    )
+    print(f"Auto delta_D = p{percentile} = {val:.4f}", flush=True)
+    return val
+
+
+def _assemble_pc_results(data_by_alpha, alphas_f):
+    """Convert predictor-corrector long-form DataFrames into the standard results dict.
+
+    data_by_alpha : {alpha: pd.DataFrame} with columns traj, step, f_D, f_R, v_dn, v_rn, category, stay_id
+    Returns results dict with dn_q_selected_action_traj etc., each list of (T, n_alphas) arrays.
+    """
+    first_df = data_by_alpha[alphas_f[0]]
+    n_alphas = len(alphas_f)
+
+    non_survivor_trajs = sorted(first_df[first_df.category == -1].traj.unique().tolist())
+    survivor_trajs     = sorted(first_df[first_df.category == 1].traj.unique().tolist())
+
+    results = {'nonsurvivors': {}, 'survivors': {}}
+
+    for traj_type, trajectories in [('nonsurvivors', non_survivor_trajs), ('survivors', survivor_trajs)]:
+        vdn_list = []
+        vrn_list = []
+        sid_list = []
+
+        for traj in trajectories:
+            traj_ref  = first_df[first_df.traj == traj].sort_values('step')
+            T         = len(traj_ref)
+            vdn_stack = np.zeros((T, n_alphas), dtype=np.float32)
+            vrn_stack = np.zeros((T, n_alphas), dtype=np.float32)
+
+            for j, alpha in enumerate(alphas_f):
+                df_a    = data_by_alpha[alpha]
+                traj_df = df_a[df_a.traj == traj].sort_values('step')
+                vdn_stack[:, j] = traj_df['v_dn'].values.astype(np.float32)
+                vrn_stack[:, j] = traj_df['v_rn'].values.astype(np.float32)
+
+            vdn_list.append(vdn_stack)
+            vrn_list.append(vrn_stack)
+            sid_list.append(traj_ref['stay_id'].iloc[0])
+
+        results[traj_type] = {
+            'dn_q_selected_action_traj': vdn_list,
+            'rn_q_selected_action_traj': vrn_list,
+            'dn_v_median_traj':          vdn_list,
+            'rn_v_median_traj':          vrn_list,
+            'stay_ids':                  sid_list,
+        }
+
+    return results
+
+
 def get_continuous_dead_end_data_grid_cvar(
     qnet_dn,
     qnet_rn,
@@ -538,17 +635,92 @@ def run(config, options, data, plot_hists):
     if continuous:
         alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
         alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
-        results = get_continuous_dead_end_data_grid_cvar(
-            qnet_dn,
-            qnet_rn,
-            encoded_data,
-            device,
-            params,
-            alphas=[float(a) for a in alpha_sweep],
-            M=params.get('bnd_M', 10),
-            log_every_traj=params.get('eval_log_every_traj', 10),
-        )
-        value_data = {"alpha": alpha_sweep, "results": results}
+        alphas_f    = [float(a) for a in alpha_sweep]
+        bnd_method  = params.get('bnd_method', 'predictor_corrector')
+
+        if bnd_method == 'predictor_corrector':
+            # Auto-calibrate delta_D: probe Q range so the boundary exists inside Q space.
+            # Without this, a hardcoded delta_D=-0.7 is often below all Q values → f_D=0
+            # everywhere → AUC=0.  Setting delta_D to the p-th percentile of CVaR values
+            # ensures ~p% of (state,action) pairs are in the dead-end region on average,
+            # so f_D varies between states and the flagging threshold sweep produces a
+            # proper ROC curve.
+            if params.get('bnd_delta_D_auto', True):
+                delta_D_dn = _probe_q_percentile(
+                    qnet_dn, encoded_data, params,
+                    percentile=params.get('bnd_delta_D_percentile', 25),
+                    n_samples=500, alpha=float(alphas_f[0]),
+                )
+                delta_D_rn = _probe_q_percentile(
+                    qnet_rn, encoded_data, params,
+                    percentile=params.get('bnd_delta_R_percentile', 75),
+                    n_samples=500, alpha=float(alphas_f[0]),
+                )
+            else:
+                delta_D_dn = params.get('bnd_delta_D', -0.5)
+                delta_D_rn = params.get('bnd_delta_R',  0.5)
+
+            data_by_alpha_dn = get_continuous_dead_end_data(
+                qnet_dn, encoded_data, device, params,
+                bnd_alphas=alphas_f,
+                bnd_delta_D=delta_D_dn,
+                bnd_M=params.get('bnd_M', 5),
+                bnd_h0=params.get('bnd_h0', 0.05),
+                bnd_eps_tol=params.get('bnd_eps_tol', 1e-4),
+                bnd_eps_close=params.get('bnd_eps_close', 0.02),
+                bnd_eps_dup=params.get('bnd_eps_dup', 0.02),
+                bnd_eta=params.get('bnd_eta', 1.5),
+                bnd_C_max=params.get('bnd_C_max', 10),
+                bnd_num_tau=params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64)),
+                checkpoint_path=os.path.join(params['checkpoint_fname'], f'pc_dn_ckpt{addon}.pkl'),
+                log_every_traj=params.get('eval_log_every_traj', 10),
+            )
+            data_by_alpha_rn = get_continuous_dead_end_data(
+                qnet_rn, encoded_data, device, params,
+                bnd_alphas=alphas_f,
+                bnd_delta_D=delta_D_rn,
+                bnd_M=params.get('bnd_M', 5),
+                bnd_h0=params.get('bnd_h0', 0.05),
+                bnd_eps_tol=params.get('bnd_eps_tol', 1e-4),
+                bnd_eps_close=params.get('bnd_eps_close', 0.02),
+                bnd_eps_dup=params.get('bnd_eps_dup', 0.02),
+                bnd_eta=params.get('bnd_eta', 1.5),
+                bnd_C_max=params.get('bnd_C_max', 10),
+                bnd_num_tau=params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64)),
+                checkpoint_path=os.path.join(params['checkpoint_fname'], f'pc_rn_ckpt{addon}.pkl'),
+                log_every_traj=params.get('eval_log_every_traj', 10),
+            )
+
+            # Merge D-network and R-network DataFrames: v_dn from D-net, v_rn from R-net.
+            # get_continuous_dead_end_data writes both v_dn=-f_D and v_rn=1-f_D using
+            # only the one network it was passed — so v_rn from the D-net call is wrong.
+            # We overwrite it here with 1 - f_R where f_R comes from the R-net call.
+            merged_by_alpha = {}
+            for alpha in alphas_f:
+                cols_dn  = ['traj', 'step', 'f_D', 'v_dn', 'category', 'stay_id']
+                cols_rn  = ['traj', 'step', 'f_D']
+                df_dn    = data_by_alpha_dn[alpha][cols_dn].copy()
+                df_rn    = data_by_alpha_rn[alpha][cols_rn].rename(columns={'f_D': 'f_R'})
+                merged   = df_dn.merge(df_rn, on=['traj', 'step'])
+                merged['v_rn'] = 1.0 - merged['f_R']
+                merged_by_alpha[alpha] = merged
+
+            results = _assemble_pc_results(merged_by_alpha, alphas_f)
+            value_data = {
+                'alpha': alpha_sweep,
+                'delta_D_dn': delta_D_dn,
+                'delta_D_rn': delta_D_rn,
+                'results': results,
+            }
+
+        else:  # 'grid_cvar' — fast approximation, no delta_D needed
+            results = get_continuous_dead_end_data_grid_cvar(
+                qnet_dn, qnet_rn, encoded_data, device, params,
+                alphas=alphas_f,
+                M=params.get('bnd_M', 10),
+                log_every_traj=params.get('eval_log_every_traj', 10),
+            )
+            value_data = {'alpha': alpha_sweep, 'results': results}
     else:
         # Discrete action space: retrieve Q-values for each state (for all actions)
         distributional = params['model'] == "IQN"
