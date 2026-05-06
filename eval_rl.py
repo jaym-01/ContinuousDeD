@@ -16,7 +16,10 @@ import torch
 from rl_utils import RLDataLoader, DQN_Agent, IQN_Agent, create_analysis_df, ContinuousIQN_OfflineAgent
 from plot_utils import plot_value_hists
 from analysis_utils import get_dn_rn_info, create_analysis_df
-from boundary_tracing import dead_end_volume_fraction, dead_end_volume_fraction_multi_alpha
+from boundary_tracing import (dead_end_volume_fraction,
+                               dead_end_volume_fraction_multi_alpha,
+                               dead_end_volume_fraction_grid,
+                               dead_end_volume_fraction_grid_batch)
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
@@ -51,51 +54,62 @@ def load_best_rl(params, sided_Q, device):
 
 def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
                                   bnd_M=10, bnd_alphas=(0.1,), bnd_delta_D=-0.5):
-    """Compute dead-end volume fraction f_D per state for all alpha values in one pass.
+    """Compute dead-end volume fraction f_D per state for all alpha values.
 
-    The M×M grid forward pass is shared across all alpha values so the network is
-    queried once per state regardless of how many alpha levels are requested.
+    Processes one trajectory at a time with a single batched forward pass of
+    size T×M² (T = trajectory length), so the GPU sees a meaningful batch rather
+    than one state at a time.
 
     Returns
     -------
-    data_by_alpha : dict {alpha: pd.DataFrame}  — one DataFrame per alpha level,
-                    each with columns traj, step, s, a, f_D, v_dn, v_rn, category, stay_id
+    data_by_alpha : dict {alpha: pd.DataFrame}
     """
     n_total = len(encoded_data['states'])
     action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
     action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
     alphas = list(bnd_alphas)
+    alphas_f = [float(a) for a in alphas]
 
-    rows_by_alpha = {float(a): [] for a in alphas}
+    rows_by_alpha = {a: [] for a in alphas_f}
 
-    print(f"Computing dead-end volume fractions via boundary tracing "
-          f"(M={bnd_M}, {len(alphas)} alpha levels, shared grid scan)...")
+    n_valid = sum(
+        1 for i in range(n_total)
+        if float(encoded_data['rewards'][i][int(encoded_data['lengths'][i].flat[0]) - 1].flat[-1]) in (-1.0, 1.0)
+    )
+    print(f"Computing dead-end volume fractions via grid estimator "
+          f"(M={bnd_M}, {len(alphas)} alpha levels, 1 forward pass per trajectory) "
+          f"— {n_valid} valid trajectories...")
 
+    n_done = 0
     for traj in range(n_total):
-        traj_len = int(encoded_data['lengths'][traj][0])
-        traj_r   = encoded_data['rewards'][traj][:traj_len]
-        terminal_r = float(traj_r[-1].flatten()[0])
+        traj_len   = int(encoded_data['lengths'][traj].flat[0])
+        traj_r     = encoded_data['rewards'][traj][:traj_len]
+        terminal_r = float(traj_r[-1].flat[-1])
         if terminal_r not in (-1.0, 1.0):
             continue
+
         category = -1 if terminal_r < 0 else 1
         traj_sid = encoded_data['stay_ids'][traj]
         traj_a   = encoded_data['actions'][traj][:traj_len]
+        states   = encoded_data['states'][traj][:traj_len]  # (T, state_dim)
+
+        # One forward pass for all T states × M² actions
+        f_D_mat = dead_end_volume_fraction_grid_batch(
+            states, qnet_dn,
+            alphas=alphas_f,
+            delta_D=bnd_delta_D,
+            M=bnd_M,
+            action_low=action_low,
+            action_high=action_high,
+        )  # (T, len(alphas))
 
         for t in range(traj_len):
-            state = encoded_data['states'][traj][t]
-            f_D_per_alpha = dead_end_volume_fraction_multi_alpha(
-                state, qnet_dn,
-                alphas=alphas,
-                delta_D=bnd_delta_D,
-                M=bnd_M,
-                action_low=action_low,
-                action_high=action_high,
-            )
-            for alpha, f_D in f_D_per_alpha.items():
+            for j, alpha in enumerate(alphas_f):
+                f_D = float(f_D_mat[t, j])
                 rows_by_alpha[alpha].append({
                     'traj':     traj,
                     'step':     t,
-                    's':        state,
+                    's':        states[t],
                     'a':        traj_a[t],
                     'f_D':      f_D,
                     'v_dn':     -f_D,
@@ -104,8 +118,9 @@ def get_continuous_dead_end_data(qnet_dn, encoded_data, device, params,
                     'stay_id':  traj_sid,
                 })
 
-        if (traj + 1) % 50 == 0:
-            print(f"  {traj + 1}/{n_total} trajectories processed")
+        n_done += 1
+        if n_done % 10 == 0:
+            print(f"  {n_done}/{n_valid} trajectories processed")
 
     return {a: pd.DataFrame(rows) for a, rows in rows_by_alpha.items()}
 
@@ -301,6 +316,7 @@ def run(config, options, data, plot_hists):
     with open(os.path.join(params['checkpoint_fname'], "pre_flag_results"+addon+".pkl"), "wb") as f:
         pickle.dump(results, f)
 
+    print("writing results")
     with open(os.path.join(local_storage_dir, "pre_flag_results"+addon+".pkl"), "wb") as f:
         pickle.dump(results, f)
 
