@@ -2,6 +2,7 @@
 Encode all the data using the best performing NCDE model.
 """
 import os, sys, time
+import json
 import argparse
 import yaml
 import random
@@ -59,6 +60,20 @@ if __name__ == '__main__':
     hhdim = ncde_hparams['hidden_hidden_dim']
     p_n_layers = ncde_hparams['pred_num_layers']
     p_n_units = ncde_hparams['pred_num_units']
+
+    meta_path = os.path.join(encode_output_dir, "encoded_meta.json")
+    meta = {
+        "ncde_config": args.config,
+        "data_dir": config_dict['data_dir'],
+        "encode_output_dir": encode_output_dir,
+        "ncde_output_dir": config_dict['output_dir'],
+        "ncde_hidden_dim": int(hdim),
+        "action_dim": int(action_dim),
+        "one_hot_actions": bool(config_dict.get('one_hot_actions', False)),
+        "n_action_bins": config_dict.get('n_action_bins', None),
+    }
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2)
     
     # Initialize the model
     model = NeuralCDE(input_dim, hdim, output_dim, static_dim, action_dim,
