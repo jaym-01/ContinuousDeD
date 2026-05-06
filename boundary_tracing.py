@@ -353,6 +353,80 @@ def dead_end_volume_fraction_grid_batch(
     return f_D
 
 
+def grid_cvar_batch(
+    states,
+    agent,
+    alphas,
+    M=10,
+    action_low=None,
+    action_high=None,
+    num_tau=64,
+    agg='max',
+):
+    """Grid-based CVaR aggregation over actions for a batch of states.
+
+    Identical forward pass to dead_end_volume_fraction_grid_batch, but instead
+    of computing the fraction of actions below a fixed delta threshold it returns
+    the aggregated (max or mean) CVaR directly. This means no delta_D calibration
+    is needed: sweeping the downstream flagging threshold is equivalent to sweeping
+    delta_D across the full Q-value range.
+
+    Parameters
+    ----------
+    states    : (N, state_dim) array
+    agent     : ContinuousIQN_OfflineAgent
+    alphas    : sequence of CVaR risk levels in (0, 1]
+    M         : grid side length (M×M actions evaluated per state)
+    agg       : 'max'  → best-case action (pessimistic dead-end view)
+                'mean' → average over grid
+
+    Returns
+    -------
+    result : (N, len(alphas)) float32
+        result[i, j] = agg_a CVaR_{alphas[j]}(Q(states[i], a))
+    """
+    device     = agent.device
+    action_dim = agent.action_dim
+
+    if action_low is None:
+        action_low  = [0.0] * action_dim
+    if action_high is None:
+        action_high = [1.0] * action_dim
+
+    states_t = torch.as_tensor(np.asarray(states, dtype=np.float32), device=device)
+    N = states_t.shape[0]
+
+    a_lo_t = torch.as_tensor(np.asarray(action_low,  np.float32), device=device)
+    a_hi_t = torch.as_tensor(np.asarray(action_high, np.float32), device=device)
+
+    ax0 = torch.linspace(float(a_lo_t[0]), float(a_hi_t[0]), M, device=device)
+    ax1 = torch.linspace(float(a_lo_t[1]), float(a_hi_t[1]), M, device=device)
+    G0, G1 = torch.meshgrid(ax0, ax1, indexing='ij')
+    grid_t = torch.stack([G0.reshape(-1), G1.reshape(-1)], dim=1)  # (M², 2)
+    A = grid_t.shape[0]
+
+    states_exp  = states_t.unsqueeze(1).expand(N, A, -1).reshape(N * A, -1)
+    actions_exp = grid_t.unsqueeze(0).expand(N, A, -1).reshape(N * A, -1)
+
+    agent.eval()
+    with torch.no_grad():
+        quantiles, _ = agent.network(states_exp, actions_exp, num_tau)  # (N*A, num_tau, 1)
+
+    sorted_q = quantiles.squeeze(-1).sort(dim=1)[0].reshape(N, A, num_tau)  # (N, A, num_tau)
+
+    alphas = list(alphas)
+    result = np.empty((N, len(alphas)), dtype=np.float32)
+    for j, alpha in enumerate(alphas):
+        k = max(1, round(alpha * num_tau))
+        cvar = sorted_q[:, :, :k].mean(dim=2)  # (N, A)
+        if agg == 'max':
+            result[:, j] = cvar.max(dim=1)[0].cpu().numpy()
+        else:
+            result[:, j] = cvar.mean(dim=1).cpu().numpy()
+
+    return result
+
+
 def dead_end_volume_fraction_grid(
     state,
     agent_dn,
