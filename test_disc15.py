@@ -132,7 +132,7 @@ def run_experiment():
             ]
             
             # Subprocess runs the command line dynamically
-            subprocess.run(cmd, check=True)
+            #subprocess.run(cmd, check=True)
             
             print(f"Evaluating agent for {n} dead-ends, Seed {seed}...")
             qd = load_pickle_cpu(os.path.join(run_dir, f"{run_info}_Qd.pkl")).qnetwork_local
@@ -275,7 +275,7 @@ def run_experiment():
     # ==========================================
     output_file = "metrics_disc.json"
     with open(output_file, 'w') as f:
-        json.dump(metrics, output_file, indent=4)
+        json.dump(metrics, f, indent=4)
 
     """plt.figure(figsize=(10, 6))
     for metric, label in zip(['precision', 'recall', 'f1', 'biou'], ['Precision', 'Recall', 'F1-Score', 'Boundary IoU']):

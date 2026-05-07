@@ -1,6 +1,6 @@
 #!/bin/bash
 #PBS -N medgrid_cont
-#PBS -l walltime=16:00:00
+#PBS -l walltime=15:00:00
 #PBS -l select=1:ncpus=1:mem=8gb:ngpus=1
 # Combine standard output and standard error into one file
 #PBS -j oe
@@ -14,7 +14,7 @@ module load Python/3.12.3-GCCcore-13.3.0
 cd /home/ContinuousDeD
 
 # Activate your virtual environment
-source /rl_venv/bin/activate
+source /home/rl_venv/bin/activate
 
 # Execute your python script
 python test_cont.py
