@@ -3,10 +3,10 @@ This file is mostly in place to preprocess the data and save it off for use late
 the overhead of continually running the rectilinear interpolation procedure over and over...
 """
 import os, sys, time
+import argparse
 import yaml
 import random
 import numpy as np
-
 
 import torch
 
@@ -14,19 +14,24 @@ from ax.service.managed_loop import optimize
 
 from ncde_utils import process_interpolate_and_save, load_data, trainer, evaluator
 from ncde import NeuralCDE
-    
+
 
 if __name__ == '__main__':
 
-    # top_folder = '/ais/bulbasaur/twkillian/AHE_Sepsis_Data'
-    # new_folder = 'rectilinear_processed'
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--config', default='ncde_config', help='Config name (without .yaml) in ./configs/')
+    args = parser.parse_args()
 
-    # process_interpolate_and_save(new_folder, top_folder)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    print(f"Device: {device}")
 
     # Load the configuration file
-    config_dict = yaml.safe_load(open("./configs/ncde_config.yaml", 'r'))
+    config_dict = yaml.safe_load(open(f"./configs/{args.config}.yaml", 'r'))
 
     # Set the random seeds
     torch.manual_seed(config_dict['seed'])
@@ -37,8 +42,18 @@ if __name__ == '__main__':
 
     # Adjust the config based on possible command line inputs... TODO...
 
+    # Ensure output directory exists
+    os.makedirs(config_dict['output_dir'], exist_ok=True)
+
+    action_kwargs = {
+        'one_hot_actions': config_dict.get('one_hot_actions', False),
+        'n_action_bins':   config_dict.get('n_action_bins', None),
+    }
+
     # Load the data
-    (train_loader, val_loader, test_loader), input_dim, action_dim, static_dim, output_dim = load_data(data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], num_actions=25)
+    (train_loader, val_loader, test_loader), input_dim, action_dim, static_dim, output_dim = load_data(
+        data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], **action_kwargs
+    )
 
 
     # Define the training function that will be used by Ax to optimize the hyperparameters
@@ -67,7 +82,7 @@ if __name__ == '__main__':
     best_parameters, values, experiment, model = optimize(
         parameters = config_dict['parameterization'],
         evaluation_function = train_evaluate,
-        objective_name = 'Masked MSE',
+        objective_name = 'Masked_MSE',
         total_trials = config_dict['total_trials'],
         minimize = True,
     )
@@ -80,7 +95,10 @@ if __name__ == '__main__':
     print("Best arm: ", best_arm)
 
     # Create a combined Train/Val dataset!
-    (combined_train_valid_loader, __, test_loader), __, __, __, __ = load_data(data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'], num_actions=25, combine_train_val=True, shuffle=True)
+    (combined_train_valid_loader, __, test_loader), __, __, __, __ = load_data(
+        data_dir=config_dict['data_dir'], batch_size=config_dict['batch_size'],
+        combine_train_val=True, shuffle=True, **action_kwargs
+    )
 
     ## Re-initialize the model using the best parameters
     ################
@@ -105,7 +123,7 @@ if __name__ == '__main__':
         'hyperparameters': best_arm.parameters,
         'experiment_data': data,
     }
-    torch.save(save_dict, config_dict['output_dir']+"best_model.pt")
+    torch.save(save_dict, os.path.join(config_dict['output_dir'], "best_model.pt"))
 
     # load_data(
     # data_dir="/ais/bulbasaur/twkillian/AHE_Sepsis_Data/rectilinear_processed/", 

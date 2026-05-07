@@ -13,9 +13,10 @@ import matplotlib.pyplot as plt
 
 import torch
 
-from rl_utils import RLDataLoader, DQN_Agent, IQN_Agent, create_analysis_df
+from rl_utils import DQN_Agent, IQN_Agent, ContinuousIQN_OfflineAgent
 from plot_utils import plot_value_hists
 from analysis_utils import get_dn_rn_info, create_analysis_df
+from boundary_tracing import dead_end_volume_fraction_multi_alpha, dead_end_volume_fraction_grid_batch, grid_cvar_batch
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
@@ -29,21 +30,414 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_best_rl(params, sided_Q, device):
     best_rl_path = os.path.join(params['checkpoint_fname'], f"best_q_parameters{sided_Q}.pt")
-    best_rl_checkpoint = torch.load(best_rl_path)
-    
+    best_rl_checkpoint = torch.load(best_rl_path, map_location=device, weights_only=False)
+
+    # Align model input size with checkpoint to avoid silent shape mismatches.
+    if 'rl_network_state_dict' in best_rl_checkpoint and 'head.weight' in best_rl_checkpoint['rl_network_state_dict']:
+        ckpt_in_dim = best_rl_checkpoint['rl_network_state_dict']['head.weight'].shape[1]
+        # For ContinuousIQN, head takes [state ∥ action], so head_dim = state_dim + action_dim.
+        # Subtract action_dim to recover the pure state_dim.
+        if params.get('model') == 'ContinuousIQN':
+            ckpt_in_dim -= params.get('action_dim', 0)
+        params['input_dim'] = int(ckpt_in_dim)
+
     # Initialize the model
     if params['model'] == 'DQN':
         model = DQN_Agent(params['input_dim'], params, sided_Q=sided_Q, device=device)
     elif params['model'] == 'IQN':
         model = IQN_Agent(params['input_dim'], params, sided_Q=sided_Q, device=device)
+    elif params['model'] == 'ContinuousIQN':
+        model = ContinuousIQN_OfflineAgent(params['input_dim'], params, sided_Q=sided_Q, device=device)
     else:
-        raise NotImplementedError('The provided model type has not yet been defined, please use DQN or IQN')
+        raise NotImplementedError('The provided model type has not yet been defined, please use DQN, IQN, or ContinuousIQN')
 
     # Load the best performing parameters (based on validation loss) into the model
     model.network.load_state_dict(best_rl_checkpoint['rl_network_state_dict'])
     model.eval()
     print(f"{sided_Q.capitalize()} Q-Network loaded")
     return model
+
+
+def _get_checkpoint_input_dim(checkpoint_path, device):
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    state_dict = checkpoint.get('rl_network_state_dict', {})
+    if 'head.weight' not in state_dict:
+        return None
+    return int(state_dict['head.weight'].shape[1])
+
+
+def _adjust_state_dim(states, target_dim, label="states"):
+    """Pad or truncate the last dimension to match target_dim."""
+    cur_dim = states.shape[-1]
+    if cur_dim == target_dim:
+        return states
+    if cur_dim < target_dim:
+        pad = target_dim - cur_dim
+        print(
+            f"Warning: {label} has {cur_dim} features; padding with {pad} zeros to match {target_dim}.",
+            flush=True,
+        )
+        return np.pad(states, ((0, 0), (0, 0), (0, pad)), mode="constant")
+    # cur_dim > target_dim
+    drop = cur_dim - target_dim
+    print(
+        f"Warning: {label} has {cur_dim} features; truncating last {drop} to match {target_dim}.",
+        flush=True,
+    )
+    return states[..., :target_dim]
+
+
+def _coerce_encoded_state_dim(encoded_data, target_dim, label):
+    """Return a dict-like encoded_data with states adjusted to target_dim."""
+    states = encoded_data['states']
+    if states.shape[-1] == target_dim:
+        return encoded_data
+
+    # Materialize arrays so we can safely replace states.
+    data_dict = {k: encoded_data[k] for k in encoded_data.files}
+    data_dict['states'] = _adjust_state_dim(data_dict['states'], target_dim, label=label)
+    return data_dict
+
+
+def _resolve_action_bounds(params):
+    action_dim = params.get('action_dim', 2)
+    action_low = params.get('action_low', [0.0] * action_dim)
+    action_high = params.get('action_high', [1.0] * action_dim)
+    if len(action_low) != action_dim or len(action_high) != action_dim:
+        raise ValueError("action_low/action_high length must match action_dim")
+    return action_low, action_high
+
+
+def get_continuous_dead_end_data(
+    qnet_dn,
+    encoded_data,
+    device,
+    params,
+    bnd_M=20,
+    bnd_alphas=(0.1,),
+    bnd_delta_D=-0.5,
+    bnd_h0=0.05,
+    bnd_eps_tol=1e-4,
+    bnd_eps_close=0.02,
+    bnd_eps_dup=0.02,
+    bnd_eta=1.5,
+    bnd_C_max=10,
+    bnd_num_tau=64,
+    checkpoint_path=None,
+    checkpoint_every=100,
+    log_every_traj=10,
+    log_every_state=0,
+):
+    """Compute dead-end volume fraction f_D per state for all alpha values.
+
+    Uses predictor-corrector boundary tracing (Algorithm 1) for continuous IQN.
+    Supports checkpoint/resume: saves progress every `checkpoint_every` valid
+    trajectories to `checkpoint_path` (per-trajectory granularity).
+
+    Returns
+    -------
+    data_by_alpha : dict {alpha: pd.DataFrame}
+    """
+    n_total = len(encoded_data['states'])
+    action_low, action_high = _resolve_action_bounds(params)
+    alphas_f = [float(a) for a in bnd_alphas]
+
+    n_valid = sum(
+        1
+        for i in range(n_total)
+        if float(encoded_data['rewards'][i][int(encoded_data['lengths'][i].flat[0]) - 1].flat[-1])
+        in (-1.0, 1.0)
+    )
+
+    rows_by_alpha = {a: [] for a in alphas_f}
+    resume_from_traj = 0
+    n_done = 0
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"Resuming from checkpoint: {checkpoint_path}", flush=True)
+        with open(checkpoint_path, 'rb') as f:
+            ckpt = pickle.load(f)
+        rows_by_alpha = ckpt['rows_by_alpha']
+        resume_from_traj = ckpt['next_traj']
+        n_done = ckpt['n_done']
+        print(
+            f"  Resuming at trajectory index {resume_from_traj} ({n_done}/{n_valid} done)",
+            flush=True,
+        )
+
+    print(
+        "Computing dead-end volume fractions via predictor-corrector tracing "
+        f"(M={bnd_M}, {len(alphas_f)} alpha levels) — {n_valid} valid trajectories...",
+        flush=True,
+    )
+
+    for traj in range(resume_from_traj, n_total):
+        traj_len = int(encoded_data['lengths'][traj].flat[0])
+        traj_r = encoded_data['rewards'][traj][:traj_len]
+        terminal_r = float(traj_r[-1].flat[-1])
+        if terminal_r not in (-1.0, 1.0):
+            continue
+
+        category = -1 if terminal_r < 0 else 1
+        traj_sid = encoded_data['stay_ids'][traj]
+        states = encoded_data['states'][traj][:traj_len]
+
+        for t in range(traj_len):
+            f_D_per_alpha = dead_end_volume_fraction_multi_alpha(
+                states[t],
+                qnet_dn,
+                alphas=alphas_f,
+                delta_D=bnd_delta_D,
+                M=bnd_M,
+                h0=bnd_h0,
+                eps_tol=bnd_eps_tol,
+                eps_close=bnd_eps_close,
+                eps_dup=bnd_eps_dup,
+                eta=bnd_eta,
+                C_max=bnd_C_max,
+                action_low=action_low,
+                action_high=action_high,
+                num_tau=bnd_num_tau,
+            )
+            if log_every_state and (t % log_every_state == 0):
+                print(
+                    f"  traj {traj} step {t}/{traj_len} (alpha={alphas_f[0]:.2f}..{alphas_f[-1]:.2f})",
+                    flush=True,
+                )
+
+            for alpha in alphas_f:
+                f_d = float(f_D_per_alpha[alpha])
+                rows_by_alpha[alpha].append(
+                    {
+                        'traj': traj,
+                        'step': t,
+                        'f_D': f_d,
+                        'v_dn': -f_d,
+                        'v_rn': 1.0 - f_d,
+                        'category': category,
+                        'stay_id': traj_sid,
+                    }
+                )
+
+        n_done += 1
+        if log_every_traj and (n_done % log_every_traj == 0):
+            print(f"  {n_done}/{n_valid} trajectories processed", flush=True)
+
+        if checkpoint_path and n_done % checkpoint_every == 0:
+            with open(checkpoint_path, 'wb') as f:
+                pickle.dump(
+                    {
+                        'rows_by_alpha': rows_by_alpha,
+                        'next_traj': traj + 1,
+                        'n_done': n_done,
+                    },
+                    f,
+                )
+            print(f"  [checkpoint saved at {n_done}/{n_valid}]", flush=True)
+
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
+        print("Checkpoint removed (run complete).")
+
+    return {a: pd.DataFrame(rows) for a, rows in rows_by_alpha.items()}
+
+def get_continuous_dead_end_data_grid(
+    qnet_dn,
+    qnet_rn,
+    encoded_data,
+    device,
+    params,
+    alphas,
+    delta_D=-0.7,
+    delta_R=0.5,
+    M=10,
+    log_every_traj=10,
+):
+    """Grid-based dead-end detection for continuous action-space IQN.
+
+    For each state computes:
+      f_D = fraction of M×M grid actions where CVaR_α(Q_D) < delta_D
+      f_R = fraction of M×M grid actions where CVaR_α(Q_R) < delta_R
+
+    Then stores v_dn = -f_D  and  v_rn = 1 - f_R, giving independent
+    D and R signals for the downstream flag condition.
+
+    Returns
+    -------
+    data_by_alpha : dict {alpha: pd.DataFrame}
+        Columns: traj, step, f_D, f_R, v_dn, v_rn, category, stay_id
+    """
+    n_total    = len(encoded_data['states'])
+    action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
+    action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
+    alphas_f   = [float(a) for a in alphas]
+    num_tau    = params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64))
+
+    n_valid = sum(
+        1 for i in range(n_total)
+        if float(encoded_data['rewards'][i][int(encoded_data['lengths'][i].flat[0]) - 1].flat[-1])
+        in (-1.0, 1.0)
+    )
+
+    rows_by_alpha = {a: [] for a in alphas_f}
+    n_done = 0
+
+    print(
+        f"Grid dead-end detection (M={M}×{M}, {len(alphas_f)} alpha levels, "
+        f"delta_D={delta_D}, delta_R={delta_R}) — {n_valid} valid trajectories...",
+        flush=True,
+    )
+
+    for traj in range(n_total):
+        traj_len   = int(encoded_data['lengths'][traj].flat[0])
+        traj_r     = encoded_data['rewards'][traj][:traj_len]
+        terminal_r = float(traj_r[-1].flat[-1])
+        if terminal_r not in (-1.0, 1.0):
+            continue
+
+        category = -1 if terminal_r < 0 else 1
+        traj_sid = encoded_data['stay_ids'][traj]
+        states   = encoded_data['states'][traj][:traj_len]  # (T, state_dim)
+
+        # Single batched forward pass per network for all T states × M² actions
+        fD = dead_end_volume_fraction_grid_batch(
+            states, qnet_dn, alphas_f,
+            delta_D=delta_D, M=M,
+            action_low=action_low, action_high=action_high,
+            num_tau=num_tau,
+        )  # (T, n_alphas)
+
+        fR = dead_end_volume_fraction_grid_batch(
+            states, qnet_rn, alphas_f,
+            delta_D=delta_R, M=M,
+            action_low=action_low, action_high=action_high,
+            num_tau=num_tau,
+        )  # (T, n_alphas)
+
+        for j, alpha in enumerate(alphas_f):
+            for t in range(traj_len):
+                f_d = float(fD[t, j])
+                f_r = float(fR[t, j])
+                rows_by_alpha[alpha].append({
+                    'traj':     traj,
+                    'step':     t,
+                    'f_D':      f_d,
+                    'f_R':      f_r,
+                    'v_dn':     -f_d,
+                    'v_rn':     1.0 - f_r,
+                    'category': category,
+                    'stay_id':  traj_sid,
+                })
+
+        n_done += 1
+        if log_every_traj and (n_done % log_every_traj == 0):
+            print(f"  {n_done}/{n_valid} trajectories processed", flush=True)
+
+    return {a: pd.DataFrame(rows) for a, rows in rows_by_alpha.items()}
+
+
+def get_continuous_dead_end_data_grid_cvar(
+    qnet_dn,
+    qnet_rn,
+    encoded_data,
+    device,
+    params,
+    alphas,
+    M=10,
+    log_every_traj=10,
+):
+    """Grid-based dead-end detection storing max CVaR over grid actions.
+
+    Replaces get_continuous_dead_end_data_grid for ROC computation.
+
+    Instead of computing f_D = fraction of actions below a fixed delta_D,
+    this stores the best-case CVaR directly:
+
+        v_dn[s, α] = max_a CVaR_α(Q_D(s,a))  ∈ [-1, 0]
+        v_rn[s, α] = max_a CVaR_α(Q_R(s,a))  ∈ [0,  1]
+
+    Why this fixes AUC=0:
+    - The old approach requires delta_D to fall inside the model's Q-value range.
+      If delta_D=-0.7 but Q_D ∈ [-0.3, 0], f_D=0 everywhere → no signal.
+    - Storing max CVaR directly gives a continuous signal whose range always
+      matches the model's outputs. Sweeping the downstream flagging threshold
+      is then equivalent to sweeping delta_D across the full Q-value range,
+      so the ROC is well-defined regardless of where Q-values are concentrated.
+
+    Returns
+    -------
+    results : dict with 'survivors' and 'nonsurvivors' sub-dicts, each containing:
+        dn_q_selected_action_traj : list[ndarray(T, n_alphas)]
+        rn_q_selected_action_traj : list[ndarray(T, n_alphas)]
+        dn_v_median_traj          : list[ndarray(T, n_alphas)]  (same as above)
+        rn_v_median_traj          : list[ndarray(T, n_alphas)]  (same as above)
+        stay_ids                  : list
+    """
+    n_total     = len(encoded_data['states'])
+    action_low  = params.get('action_low',  [0.0] * params.get('action_dim', 2))
+    action_high = params.get('action_high', [1.0] * params.get('action_dim', 2))
+    alphas_f    = [float(a) for a in alphas]
+    num_tau     = params.get('bnd_num_tau', params.get('num_iqn_samples_est', 64))
+
+    n_valid = sum(
+        1 for i in range(n_total)
+        if float(encoded_data['rewards'][i][int(encoded_data['lengths'][i].flat[0]) - 1].flat[-1])
+        in (-1.0, 1.0)
+    )
+    print(
+        f"Grid CVaR evaluation (M={M}×{M}, {len(alphas_f)} alpha levels, "
+        f"max over grid) — {n_valid} valid trajectories...",
+        flush=True,
+    )
+
+    ns_bucket = {'v_dn': [], 'v_rn': [], 'stay_ids': []}
+    s_bucket  = {'v_dn': [], 'v_rn': [], 'stay_ids': []}
+    n_done = 0
+
+    for traj in range(n_total):
+        traj_len   = int(encoded_data['lengths'][traj].flat[0])
+        traj_r     = encoded_data['rewards'][traj][:traj_len]
+        terminal_r = float(traj_r[-1].flat[-1])
+        if terminal_r not in (-1.0, 1.0):
+            continue
+
+        category = -1 if terminal_r < 0 else 1
+        traj_sid = encoded_data['stay_ids'][traj]
+        states   = encoded_data['states'][traj][:traj_len]  # (T, state_dim)
+
+        vdn = grid_cvar_batch(
+            states, qnet_dn, alphas_f, M=M,
+            action_low=action_low, action_high=action_high,
+            num_tau=num_tau, agg='max',
+        )  # (T, n_alphas)
+        vdn = np.clip(vdn, -1.0, 0.0)
+
+        vrn = grid_cvar_batch(
+            states, qnet_rn, alphas_f, M=M,
+            action_low=action_low, action_high=action_high,
+            num_tau=num_tau, agg='max',
+        )  # (T, n_alphas)
+        vrn = np.clip(vrn, 0.0, 1.0)
+
+        bucket = ns_bucket if category == -1 else s_bucket
+        bucket['v_dn'].append(vdn)
+        bucket['v_rn'].append(vrn)
+        bucket['stay_ids'].append(traj_sid)
+
+        n_done += 1
+        if log_every_traj and (n_done % log_every_traj == 0):
+            print(f"  {n_done}/{n_valid} trajectories processed", flush=True)
+
+    def _pack(bucket):
+        return {
+            'dn_q_selected_action_traj': bucket['v_dn'],
+            'rn_q_selected_action_traj': bucket['v_rn'],
+            'dn_v_median_traj':          bucket['v_dn'],
+            'rn_v_median_traj':          bucket['v_rn'],
+            'stay_ids':                  bucket['stay_ids'],
+        }
+
+    return {'nonsurvivors': _pack(ns_bucket), 'survivors': _pack(s_bucket)}
+
 
 #############################
 ##     MAIN EXECUTOR
@@ -65,8 +459,7 @@ def run(config, options, data, plot_hists):
     addon = "_overlap" if data=='overlap' else ""
 
     local_storage_dir = os.path.join("stats", "/".join(split_fname[-3:]))
-    if not os.path.exists(local_storage_dir):
-        os.makedirs(local_storage_dir)
+    os.makedirs(local_storage_dir, exist_ok=True)
 
     # Replace configuration parameters by command line provided 'options'
     for opt in options:
@@ -90,88 +483,143 @@ def run(config, options, data, plot_hists):
     # Load the data
     encoded_data = np.load(os.path.join(params['data_dir'], f'encoded_{data}.npz'), allow_pickle=True)
 
-    params["input_dim"] = encoded_data['states'].shape[-1]
+    data_input_dim = encoded_data['states'].shape[-1]
+    ckpt_path = os.path.join(params['checkpoint_fname'], "best_q_parametersnegative.pt")
+    ckpt_input_dim = _get_checkpoint_input_dim(ckpt_path, device)
+
+    # For ContinuousIQN, the checkpoint head takes [state ∥ action] so head_dim = state_dim + action_dim.
+    # Recover the pure state_dim before comparing with the encoded data dimension.
+    ckpt_state_dim = ckpt_input_dim
+    if ckpt_input_dim is not None and params.get('model') == 'ContinuousIQN':
+        ckpt_state_dim = ckpt_input_dim - params.get('action_dim', 0)
+
+    if ckpt_state_dim is not None and ckpt_state_dim != data_input_dim:
+        print(
+            "Input-dimension mismatch between encoded data and checkpoint. "
+            f"Encoded data has {data_input_dim} features, but checkpoint expects {ckpt_state_dim}.",
+            flush=True,
+        )
+        encoded_data = _coerce_encoded_state_dim(
+            encoded_data,
+            ckpt_state_dim,
+            label=f"encoded_{data}",
+        )
+        data_input_dim = ckpt_state_dim
+
+    params["input_dim"] = data_input_dim
+
+    # For ContinuousIQN, compute per-dim state mean/std from training data so that
+    # the network's _s_mean/_s_scale are 116-dim (matching the NCDE-encoded states)
+    # rather than falling back to the 4-dim SpaceEnv hardcoded defaults.
+    if params.get('model') == 'ContinuousIQN':
+        print("Computing state normalisation statistics from training data...")
+        tr_npz  = np.load(os.path.join(params['data_dir'], 'encoded_train.npz'), allow_pickle=True)
+        val_npz = np.load(os.path.join(params['data_dir'], 'encoded_validation.npz'), allow_pickle=True)
+        state_dim = params["input_dim"]
+        tr_states = _adjust_state_dim(tr_npz['states'], state_dim, label="encoded_train")
+        val_states = _adjust_state_dim(val_npz['states'], state_dim, label="encoded_validation")
+        all_states = np.concatenate([
+            tr_states.reshape(-1, state_dim),
+            val_states.reshape(-1, state_dim),
+        ], axis=0)
+        params['state_mean'] = all_states.mean(axis=0)
+        params['state_std']  = all_states.std(axis=0).clip(min=1e-8)
 
     print("Loading best Q-Networks and making Q-values ...")
-    
+
     # Initialize and load the trained models
     qnet_dn = load_best_rl(params, "negative", device)
     qnet_rn = load_best_rl(params, "positive", device)
 
-    # Retrieve the Q-values for each state (for all actions)
-    distributional = params['model'] == "IQN"
-    data = get_dn_rn_info(qnet_dn, qnet_rn, encoded_data, device, distributional=distributional)
+    continuous = params['model'] == 'ContinuousIQN'
+    distributional = False  # overridden below for discrete IQN
+    VaR_thresholds = np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
 
-    with open(os.path.join(params['checkpoint_fname'], "value_data"+addon+".pkl"), "wb") as f:
-        pickle.dump(data, f)
+    if continuous:
+        alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
+        alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
+        results = get_continuous_dead_end_data_grid_cvar(
+            qnet_dn,
+            qnet_rn,
+            encoded_data,
+            device,
+            params,
+            alphas=[float(a) for a in alpha_sweep],
+            M=params.get('bnd_M', 10),
+            log_every_traj=params.get('eval_log_every_traj', 10),
+        )
+        value_data = {"alpha": alpha_sweep, "results": results}
+    else:
+        # Discrete action space: retrieve Q-values for each state (for all actions)
+        distributional = params['model'] == "IQN"
+        data = get_dn_rn_info(qnet_dn, qnet_rn, encoded_data, device, distributional=distributional)
+        data = pd.DataFrame(data)
 
-    with open(os.path.join(local_storage_dir, "value_data"+addon+".pkl"), "wb") as f:
-        pickle.dump(data, f)
-
-    VaR_thresholds =  np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
-    results = {"survivors": {}, "nonsurvivors": {}}
-    non_survivor_trajectories = sorted(data[data.category == -1].traj.unique().tolist())
-    survivor_trajectories = sorted(data[data.category == 1].traj.unique().tolist())
-    for i, trajectories in enumerate([non_survivor_trajectories, survivor_trajectories]):
-        if i == 0:
-            traj_type = "nonsurvivors"
-            print("----------- Non-survivors")
-        else:
-            traj_type = "survivors"
-            print("+++++++++++ Survivors")
-
-        dn_q_traj = []
-        rn_q_traj = []
-        dn_q_selected_action_traj = []
-        rn_q_selected_action_traj = []
-        dn_q_CVaR_traj = []
-        rn_q_CVaR_traj = []
-        sid_traj = []  # Keep track of the specific stay IDs associated with each patient trajectory (for analysis purposes)
-        for traj in trajectories:
-            d = data[data.traj == traj]
-            sid_traj.append(d.stay_id.tolist()[0])  # We only need one Stay ID per trajectory (was repeated across time for each trajectory in this column)
-            dn_q_traj.append(np.array(d.q_dn.tolist(), dtype=np.float32))
-            rn_q_traj.append(np.array(d.q_rn.tolist(), dtype=np.float32))
-            if not distributional:
-                dn_q_selected_action = [d.q_dn.tolist()[t][d.a.tolist()[t]] for t in range(d.q_dn.shape[0])] 
-                rn_q_selected_action = [d.q_rn.tolist()[t][d.a.tolist()[t]] for t in range(d.q_rn.shape[0])] 
+        results = {"survivors": {}, "nonsurvivors": {}}
+        non_survivor_trajectories = sorted(data[data.category == -1].traj.unique().tolist())
+        survivor_trajectories = sorted(data[data.category == 1].traj.unique().tolist())
+        for i, trajectories in enumerate([non_survivor_trajectories, survivor_trajectories]):
+            if i == 0:
+                traj_type = "nonsurvivors"
+                print("----------- Non-survivors")
             else:
-                (num_steps, num_samples, num_actions) = dn_q_traj[-1].shape
-                cvar_dn_traj = np.zeros((num_steps, len(VaR_thresholds), num_actions))
-                cvar_rn_traj = np.zeros((num_steps, len(VaR_thresholds), num_actions))
-                # Loop through all VaR thresholds and the extract the selected action
-                for i, var in enumerate(VaR_thresholds):
-                    var_cutoff = round(var*num_samples)
-                    cvar_dn_traj[:, i, :] = np.mean(dn_q_traj[-1][:, :var_cutoff, :], axis=1)
-                    cvar_rn_traj[:, i, :] = np.mean(rn_q_traj[-1][:, :var_cutoff, :], axis=1)
+                traj_type = "survivors"
+                print("+++++++++++ Survivors")
 
-                # Select the CVaR values for only the actions that were actually used
-                dn_q_selected_action = torch.from_numpy(cvar_dn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, 20, 1)).squeeze().numpy()
-                rn_q_selected_action = torch.from_numpy(cvar_rn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, 20, 1)).squeeze().numpy()
+            dn_q_selected_action_traj = []
+            rn_q_selected_action_traj = []
+            dn_v_median_traj = []
+            rn_v_median_traj = []
+            sid_traj = []
+            for traj in trajectories:
+                d = data[data.traj == traj]
+                sid_traj.append(d.stay_id.tolist()[0])
 
-                # Record the CVaR values for all VaR thresholds (for computing the median across actions)
-                dn_q_CVaR_traj.append(cvar_dn_traj)
-                rn_q_CVaR_traj.append(cvar_rn_traj)
-                
-            dn_q_selected_action_traj.append(dn_q_selected_action)
-            rn_q_selected_action_traj.append(rn_q_selected_action)
-        
+                dn_q_traj = np.array(d.q_dn.tolist(), dtype=np.float32)
+                rn_q_traj = np.array(d.q_rn.tolist(), dtype=np.float32)
+                if not distributional:
+                    dn_q_selected_action = [d.q_dn.tolist()[t][d.a.tolist()[t]] for t in range(d.q_dn.shape[0])]
+                    rn_q_selected_action = [d.q_rn.tolist()[t][d.a.tolist()[t]] for t in range(d.q_rn.shape[0])]
+                    dn_q_selected_action_traj.append(dn_q_selected_action)
+                    rn_q_selected_action_traj.append(rn_q_selected_action)
+                    dn_v_median_traj.append(np.median(dn_q_traj, axis=1))
+                    rn_v_median_traj.append(np.median(rn_q_traj, axis=1))
+                else:
+                    (num_steps, num_samples, num_actions) = dn_q_traj.shape
+                    cvar_dn_traj = np.zeros((num_steps, len(VaR_thresholds), num_actions))
+                    cvar_rn_traj = np.zeros((num_steps, len(VaR_thresholds), num_actions))
+                    for ii, var in enumerate(VaR_thresholds):
+                        var_cutoff = round(var * num_samples)
+                        cvar_dn_traj[:, ii, :] = np.mean(dn_q_traj[:, :var_cutoff, :], axis=1)
+                        cvar_rn_traj[:, ii, :] = np.mean(rn_q_traj[:, :var_cutoff, :], axis=1)
 
-        results[traj_type]["dn_q_selected_action_traj"] = dn_q_selected_action_traj
-        results[traj_type]["rn_q_selected_action_traj"] = rn_q_selected_action_traj
-        results[traj_type]["stay_ids"] = sid_traj
-        if not distributional:
-            results[traj_type]["dn_v_median_traj"] = [np.median(q, axis=1) for q in dn_q_traj]
-            results[traj_type]["rn_v_median_traj"] = [np.median(q, axis=1) for q in rn_q_traj]
-        else:
-            results[traj_type]["dn_v_median_traj"] = [np.median(q, axis=2) for q in dn_q_CVaR_traj]
-            results[traj_type]["rn_v_median_traj"] = [np.median(q, axis=2) for q in rn_q_CVaR_traj]
+                    dn_q_selected_action = torch.from_numpy(cvar_dn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, 20, 1)).squeeze().numpy()
+                    rn_q_selected_action = torch.from_numpy(cvar_rn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, 20, 1)).squeeze().numpy()
+                    dn_q_selected_action_traj.append(dn_q_selected_action)
+                    rn_q_selected_action_traj.append(rn_q_selected_action)
+                    dn_v_median_traj.append(np.median(cvar_dn_traj, axis=2))
+                    rn_v_median_traj.append(np.median(cvar_rn_traj, axis=2))
 
+            results[traj_type]["dn_q_selected_action_traj"] = dn_q_selected_action_traj
+            results[traj_type]["rn_q_selected_action_traj"] = rn_q_selected_action_traj
+            results[traj_type]["stay_ids"] = sid_traj
+            results[traj_type]["dn_v_median_traj"] = dn_v_median_traj
+            results[traj_type]["rn_v_median_traj"] = rn_v_median_traj
+
+        value_data = data
+
+    print("Writing value_data...", flush=True)
+    with open(os.path.join(params['checkpoint_fname'], "value_data"+addon+".pkl"), "wb") as f:
+        pickle.dump(value_data, f)
+    with open(os.path.join(local_storage_dir, "value_data"+addon+".pkl"), "wb") as f:
+        pickle.dump(value_data, f)
+
+    print("Writing pre_flag_results...", flush=True)
     with open(os.path.join(params['checkpoint_fname'], "pre_flag_results"+addon+".pkl"), "wb") as f:
         pickle.dump(results, f)
-
     with open(os.path.join(local_storage_dir, "pre_flag_results"+addon+".pkl"), "wb") as f:
         pickle.dump(results, f)
+    print("Done — pre_flag_results written successfully.", flush=True)
 
 
     if plot_hists:
@@ -180,10 +628,17 @@ def run(config, options, data, plot_hists):
 
         # Create arrays of additional subsampling of the computed values
         # This accounts for the extra outer loop needed to analyze the distributional RL results
-        if distributional: 
-            VaR_thresholds =  np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
-        else:
+        if continuous:
+            alpha_sweep = params.get('bnd_alpha_sweep', VaR_thresholds)
+            alpha_sweep = np.asarray(alpha_sweep, dtype=np.float32)
+            if len(alpha_sweep) > 1:
+                VaR_thresholds = alpha_sweep
+            else:
+                VaR_thresholds = [None]
+        elif not distributional:
             VaR_thresholds = [None]
+        else:
+            VaR_thresholds =  np.round(np.linspace(0.05, 1.0, num=20), decimals=2)
 
         time_steps = [-72, -48, -24, -12, -8, -4, -1]  # The hours before the terminal observation that we want to construct histograms for
 

@@ -1,0 +1,66 @@
+seed: 2022
+model: "ContinuousIQN"
+
+# ------------------------------------------------------------------
+# Continuous action space
+# IV fluid dose and vasopressor dose, already min-max normalised to
+# [0, 1] in the data (fluid ÷ 10,000 mL; vasopressor ÷ 475.2 μg/kg/min)
+# ------------------------------------------------------------------
+action_dim: 2
+action_low:  [0.0, 0.0]
+action_high: [1.0, 1.0]
+
+# ------------------------------------------------------------------
+# Network architecture
+# Wider (128) and slightly deeper (2 layers) than the discrete baseline
+# (64 / 1 layer) because the Q-network now takes state+action as input
+# rather than just state, and outputs a scalar distribution.
+# ------------------------------------------------------------------
+num_q_hidden_units: 128
+num_q_layers: 2
+num_iqn_samples_train: 64   # quantile samples during training (N) — matches paper
+num_iqn_samples_est: 64     # quantile samples during action selection (K)
+K_actions: 64               # random-shooting candidates for 2-D action space
+drm: "identity"             # distortion risk measure (identity = standard IQN)
+eta: 0.71                   # DRM scaling (unused when drm=identity)
+dueling: False
+noisy_layer: False
+
+# ------------------------------------------------------------------
+# Optimisation
+# ------------------------------------------------------------------
+gamma: 1.0          # undiscounted — required for DeD dead-end signal propagation
+lr: 0.00002         # 2e-5 — matches paper; must be low when CQL is active
+tau: 0.005          # Polyak averaging coefficient for target network
+q_update_freq: 5    # target network update every N gradient steps
+use_cql: True       # paper always uses CQL
+cql_weight: 0.035   # paper β=0.035; paper Fig.10 shows β>0.2 causes collapse
+
+# ------------------------------------------------------------------
+# Data
+# ------------------------------------------------------------------
+data_dir: "data/continuous_mimic/rectilinear_processed/"
+train_batch_size: 256
+val_batch_size: 128
+num_ps: 2           # positive (survivor) terminal transitions added per minibatch
+num_ns: 4           # negative (death) terminal transitions added per minibatch
+
+# ------------------------------------------------------------------
+# Training loop
+# ------------------------------------------------------------------
+num_epochs: 75
+saving_period: 1    # validate and checkpoint every epoch
+checkpoint_fname: "runs/iqn_continuous_mimic/"
+
+# ------------------------------------------------------------------
+# Evaluation (grid-based dead-end detection)
+# ------------------------------------------------------------------
+bnd_delta_D: -0.7   # Q_D threshold: actions with CVaR_α(Q_D) < -0.7 are dead-end
+bnd_delta_R: 0.5    # Q_R threshold: actions with CVaR_α(Q_R) < 0.5 are non-recovery
+bnd_M: 10           # grid side length (M×M actions per state)
+
+# ------------------------------------------------------------------
+# Misc
+# ------------------------------------------------------------------
+combined: False     # if True, train a single net on both +/- rewards
+smoke_test: False   # if True, use 500 transitions and 2 epochs for a quick sanity check

@@ -1,8 +1,14 @@
 import operator
 import gc
+import os as _os
+import sys as _sys
 
 import numpy as np
 import pandas as pd
+
+# Make toy_domain importable regardless of working directory
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'toy_domain'))
+from model_continuous import ContinuousIQN as _ContinuousIQN
 
 
 class _DRM:
@@ -115,13 +121,17 @@ class RLDataLoader(object):
 
             # Combine the encoded states
             self.encoded_data = np.vstack((tr_data['states'], v_data['states']))
-            # Combine the actions, ensure that they're integers and remove unncessary dims
-            self.encoded_actions = np.vstack(
-                (
-                    tr_data['actions'].astype(int).squeeze(),
-                    v_data['actions'].astype(int).squeeze()
+            # Combine the actions — keep continuous (float32) or cast to int for discrete
+            _tr_acts = tr_data['actions']
+            _v_acts  = v_data['actions']
+            if _tr_acts.ndim == 3 and _tr_acts.shape[-1] > 1:
+                self.encoded_actions = np.vstack((_tr_acts.astype(np.float32), _v_acts.astype(np.float32)))
+                self.continuous_actions = True
+            else:
+                self.encoded_actions = np.vstack(
+                    (_tr_acts.astype(int).squeeze(), _v_acts.astype(int).squeeze())
                 )
-            )
+                self.continuous_actions = False
             # Combine the rewards, remove unecessary dims
             self.encoded_rewards = np.vstack((tr_data['rewards'].squeeze(), v_data['rewards'].squeeze()))
             # Combine the recorded lengths of each trajectory, change to integers (for indexing purposes)
@@ -129,8 +139,14 @@ class RLDataLoader(object):
         else:
             encoded_data_file = np.load(data_dir+"encoded_{}.npz".format(dataset))
             self.encoded_data = encoded_data_file['states']
-            # Ensure that the actions are recorded as integers since they'll be used to index the Q-value returns
-            self.encoded_actions = encoded_data_file['actions'].astype(int).squeeze()  # Removing unneeded extra final dimension... If (N, T, 1) -> (N, T)... If (N,T,num_actions) (one-hot encoded), then nothing changes
+            # Detect continuous (N, T, action_dim>1) vs discrete (N, T) or (N, T, 1) actions
+            _raw_acts = encoded_data_file['actions']
+            if _raw_acts.ndim == 3 and _raw_acts.shape[-1] > 1:
+                self.encoded_actions = _raw_acts.astype(np.float32)   # (N, T, action_dim) float
+                self.continuous_actions = True
+            else:
+                self.encoded_actions = _raw_acts.astype(int).squeeze()  # (N, T) int
+                self.continuous_actions = False
             self.encoded_rewards = encoded_data_file['rewards'].squeeze()  # Removing unneeded extra final dimension... (N, T, 1) -> (N,T)
             # Change the recorded lengths of each trajectory since this quantity is used to index the other arrays
             self.encoded_lengths = encoded_data_file['lengths'].astype(int).squeeze() # Removing unneeded extra final dimension... (N, 1) -> (N,)
@@ -212,7 +228,33 @@ class RLDataLoader(object):
 
         # Compute the number of minibatches that will be drawn per epoch
         self.num_minibatches_epoch = int(np.floor(self.transition_data_size / self.minibatch_size)) + int(1 - self.drop_smaller_than_minibatch)
-    
+
+    def compute_state_stats(self):
+        """Compute per-dimension mean and std from all stored transition states.
+
+        Call after make_transition_data(). Used to normalise state inputs for the
+        continuous IQN agent.
+
+        Returns
+        -------
+        state_mean : ndarray, shape (state_dim,)
+        state_std  : ndarray, shape (state_dim,)
+        """
+        all_s = np.stack(list(self.transition_data['s'].values()), axis=0)
+        self.state_mean = all_s.mean(axis=0)
+        self.state_std  = all_s.std(axis=0).clip(min=1e-8)
+        return self.state_mean, self.state_std
+
+    def release(self):
+        """Free the raw encoded arrays (states, actions, rewards) to save memory.
+
+        Equivalent to calling make_transition_data(release=True) but can be called
+        separately after compute_state_stats() has already used the transition data.
+        """
+        del self.encoded_data, self.encoded_actions, self.encoded_rewards
+        self.encoded_data = self.encoded_actions = self.encoded_rewards = None
+        gc.collect()
+
     def get_next_minibatch(self):
         if self.epoch_finished == True:
             print('Epoch finished, please call reset() method before next call to get_next_minibatch()')
@@ -236,7 +278,15 @@ class RLDataLoader(object):
         # operator.itemgetter just appends the extracted subarrays in a tuple, wrap in np.float32 to get ndarrays
         # We also cast these elements to torch Tensors and move to the computation device so they're ready for processing right away
         s_minibatch = torch.from_numpy(np.float32(get_from_dict(self.transition_data['s']))).to(self.device)
-        actions_minibatch = torch.from_numpy(np.float32(get_from_dict(self.transition_data['actions']))).to(self.device, dtype=torch.int64)
+        if self.continuous_actions:
+            # Each entry is a (action_dim,) float array — stack into (batch, action_dim)
+            actions_minibatch = torch.from_numpy(
+                np.stack(list(get_from_dict(self.transition_data['actions'])), axis=0).astype(np.float32)
+            ).to(self.device)
+        else:
+            actions_minibatch = torch.from_numpy(
+                np.float32(get_from_dict(self.transition_data['actions']))
+            ).to(self.device, dtype=torch.int64)
         rewards_minibatch = torch.from_numpy(np.float32(get_from_dict(self.transition_data['rewards']))).to(self.device)
         next_s_minibatch = torch.from_numpy(np.float32(get_from_dict(self.transition_data['next_s']))).to(self.device)
         terminals_minibatch = torch.from_numpy(np.float32(get_from_dict(self.transition_data['terminals']))).to(self.device)
@@ -295,7 +345,7 @@ class DQN_Agent(nn.Module):
         self.update_freq = params.get("q_update_freq", 25)
 
         # Set up the optimizer
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr, amsgrad=True)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr, amsgrad=True, weight_decay=1e-4)
 
     def _train_on_batch(self, s, a, r, s2, t):
         """With the provided batch of data, run a training Bellman update."""
@@ -629,7 +679,7 @@ class IQN_Agent(nn.Module):
         self.update_counter = 0
         self.update_freq = params.get("q_update_freq", 25)
 
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr)
+        self.optimizer = optim.Adam(self.network.parameters(), lr=self.lr, weight_decay=1e-4)
         print(self.network)
 
         self.t_step = 0
@@ -877,3 +927,223 @@ def evaluator(Dnet, Rnet, val_data, thresholds, distributional=True, device="cpu
     elif output_type == 'mean':
         print(f'Average AUC for this model: {np.mean(out_auc)}')
         return np.mean(out_auc)
+
+
+##########################################################
+#   CONTINUOUS IQN OFFLINE AGENT (for MIMIC pipeline)
+##########################################################
+
+class ContinuousIQN_OfflineAgent(nn.Module):
+    """Offline-compatible continuous IQN for MIMIC training pipeline.
+
+    Exposes the same learn(s,a,r,s2,t) / get_loss(s,a,r,s2,t) interface as
+    the discrete IQN_Agent so train_rl.py works without structural changes.
+
+    Action selection for the TD target uses random shooting: K uniform
+    candidate actions are sampled, evaluated under the target Q-network,
+    and the best (mean-quantile argmax) is chosen to construct the target.
+
+    Parameters
+    ----------
+    state_size : int
+        Dimension of the NCDE-encoded state vector.
+    params : dict
+        Config dict.  Must contain 'action_dim'; may contain:
+        action_low, action_high, num_q_hidden_units, num_iqn_samples_train,
+        num_iqn_samples_est, K_actions, gamma, tau, q_update_freq, lr,
+        drm, eta, seed, state_mean, state_std, use_cql, cql_weight.
+    sided_Q : str
+        'negative' (D-net), 'positive' (R-net), or 'both'.
+    device : str
+    """
+
+    def __init__(self, state_size, params, sided_Q='negative', device='cpu'):
+        super().__init__()
+        action_dim  = params['action_dim']
+        action_low  = params.get('action_low',  [0.0] * action_dim)
+        action_high = params.get('action_high', [1.0] * action_dim)
+        layer_size  = params.get('num_q_hidden_units', 128)
+        N           = params.get('num_iqn_samples_train', 32)
+        K_est       = params.get('num_iqn_samples_est',   32)
+
+        self.N           = N
+        self.K_actions   = params.get('K_actions', 64)
+        self.gamma       = params.get('gamma', 1.0)
+        self.tau         = params.get('tau', 0.005)
+        self.sided_Q     = sided_Q
+        self.device      = device
+        self.action_dim  = action_dim
+        self.use_cql     = params.get('use_cql', False)
+        self.cql_weight  = params.get('cql_weight', 0.5)
+
+        self.action_low  = torch.FloatTensor(action_low).to(device)
+        self.action_high = torch.FloatTensor(action_high).to(device)
+
+        # Build state normalisation bounds from training stats (mean ± 3σ)
+        s_mean = params.get('state_mean', None)
+        s_std  = params.get('state_std',  None)
+        if s_mean is not None and s_std is not None:
+            s_low  = (s_mean - 3.0 * s_std).tolist()
+            s_high = (s_mean + 3.0 * s_std).tolist()
+        else:
+            s_low = s_high = None
+
+        iqn_kwargs = dict(
+            state_size  = (state_size,),
+            action_dim  = action_dim,
+            layer_size  = layer_size,
+            seed        = params.get('seed', 0),
+            N           = N,
+            K           = K_est,
+            drm         = params.get('drm', 'identity'),
+            eta         = params.get('eta', 0.71),
+            device      = device,
+            state_low   = s_low,
+            state_high  = s_high,
+            action_low  = action_low,
+            action_high = action_high,
+        )
+        self.network        = _ContinuousIQN(**iqn_kwargs).to(device)
+        self.target_network = _ContinuousIQN(**iqn_kwargs).to(device)
+        self.target_network.load_state_dict(self.network.state_dict())
+
+        self.optimizer      = optim.Adam(
+            self.network.parameters(), lr=params.get('lr', 2.5e-4), weight_decay=1e-4
+        )
+        self.update_counter = 0
+        self.update_freq    = params.get('q_update_freq', 5)
+        print(self.network)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _clamp(self, x):
+        """Clamp Q-values / rewards according to sided_Q."""
+        if self.sided_Q == 'negative':
+            return torch.clamp(x, min=-1.0, max=0.0)
+        elif self.sided_Q == 'positive':
+            return torch.clamp(x, min=0.0,  max=1.0)
+        else:
+            return torch.clamp(x, min=-1.0, max=1.0)
+
+    def _build_td_target(self, s2, r, t):
+        """Construct Bellman target using random-shooting over K actions.
+
+        Returns
+        -------
+        Q_targets : Tensor, shape (batch, N, 1)  — already clamped
+        """
+        batch_size = s2.shape[0]
+        K = self.K_actions
+
+        # Sample K uniform candidate actions for each next-state
+        rand_u = torch.rand(batch_size * K, self.action_dim, device=self.device)
+        rand_a = rand_u * (self.action_high - self.action_low) + self.action_low
+
+        # Expand next-states to match: (batch*K, state_dim)
+        ns_exp = s2.unsqueeze(1).expand(batch_size, K, -1).reshape(batch_size * K, -1)
+
+        # Mean Q over quantiles for each candidate: (batch*K, N, 1) → (batch, K)
+        q_cand, _ = self.target_network(ns_exp, rand_a, self.N)
+        q_mean = q_cand.mean(dim=1).view(batch_size, K)          # (batch, K)
+        best_idx = q_mean.argmax(dim=1)                           # (batch,)
+
+        # Retrieve best action
+        best_a = rand_a.view(batch_size, K, self.action_dim)[
+            torch.arange(batch_size, device=self.device), best_idx
+        ]                                                          # (batch, action_dim)
+
+        # Full quantile distribution for best action: (batch, N, 1)
+        Q_next, _ = self.target_network(s2, best_a, self.N)
+        Q_next = self._clamp(Q_next)
+
+        # Bellman backup
+        r_c = self._clamp(r).view(batch_size, 1, 1)
+        t_  = t.view(batch_size, 1, 1)
+        Q_targets = r_c + self.gamma * Q_next * (1.0 - t_)
+        Q_targets = self._clamp(Q_targets)
+        return Q_targets                                           # (batch, N, 1)
+
+    def _quantile_loss(self, Q_targets, Q_expected, taus):
+        """Cross-quantile Huber loss (same as discrete IQN_Agent).
+
+        Parameters
+        ----------
+        Q_targets : (batch, N, 1)
+        Q_expected: (batch, N, 1)
+        taus      : (batch, N, 1)
+
+        Returns scalar loss tensor.
+        """
+        # Broadcast: (batch, 1, N) - (batch, N, 1) → (batch, N, N)
+        td_error = Q_targets.transpose(1, 2) - Q_expected
+        huber_l  = calculate_huber_loss(td_error, 1.0)
+        quantil_l = (taus - (td_error.detach() < 0).float()).abs() * huber_l
+        return quantil_l.sum(dim=1).mean(dim=1).mean()
+
+    def _soft_update(self):
+        """Polyak averaging: θ_target = τ·θ_local + (1-τ)·θ_target."""
+        for tp, lp in zip(self.target_network.parameters(), self.network.parameters()):
+            tp.data.copy_(self.tau * lp.data + (1.0 - self.tau) * tp.data)
+
+    # ------------------------------------------------------------------
+    # Public interface (matches discrete IQN_Agent)
+    # ------------------------------------------------------------------
+
+    def learn(self, s, a, r, s2, t):
+        """Offline training step on one minibatch.
+
+        Parameters
+        ----------
+        s  : (batch, state_dim)  float tensor
+        a  : (batch, action_dim) float tensor  ← continuous actions
+        r  : (batch,)            float tensor
+        s2 : (batch, state_dim)  float tensor
+        t  : (batch,)            float tensor  (1.0 = terminal)
+
+        Returns
+        -------
+        loss : float (numpy scalar)
+        """
+        with torch.no_grad():
+            Q_targets = self._build_td_target(s2, r, t)   # (batch, N, 1)
+
+        Q_expected, taus = self.network(s, a, self.N)      # (batch, N, 1)
+        loss = self._quantile_loss(Q_targets, Q_expected, taus)
+
+        if self.use_cql:
+            # Conservative penalty: push down Q on random OOD actions
+            K_cql = self.K_actions
+            batch_size = s.shape[0]
+            rand_u  = torch.rand(batch_size * K_cql, self.action_dim, device=self.device)
+            rand_a  = rand_u * (self.action_high - self.action_low) + self.action_low
+            s_exp   = s.unsqueeze(1).expand(batch_size, K_cql, -1).reshape(batch_size * K_cql, -1)
+            q_rand, _ = self.network(s_exp, rand_a, self.N)            # (batch*K, N, 1)
+            q_rand_mean = q_rand.mean(dim=1).view(batch_size, K_cql)   # (batch, K)
+            min_q_loss  = torch.logsumexp(q_rand_mean, dim=1).mean()   # scalar
+            penalty = (min_q_loss - Q_expected.mean()) * self.cql_weight
+            loss = loss + penalty
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        clip_grad_norm_(self.network.parameters(), 1.0)
+        self.optimizer.step()
+
+        self.update_counter += 1
+        if self.update_counter >= self.update_freq:
+            self._soft_update()
+            self.update_counter = 0
+
+        return loss.detach().cpu().numpy()
+
+    def get_loss(self, s, a, r, s2, t):
+        """Validation loss — no gradients or parameter updates.
+
+        Same signature as learn(); used by validate_network() in train_rl.py.
+        """
+        with torch.no_grad():
+            Q_targets  = self._build_td_target(s2, r, t)
+            Q_expected, taus = self.network(s, a, self.N)
+            loss = self._quantile_loss(Q_targets, Q_expected, taus)
+        return loss.detach().cpu().numpy()

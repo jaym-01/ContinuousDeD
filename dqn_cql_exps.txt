@@ -1,5 +1,0 @@
--c dqn_cql -o cql_weight 0.4 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/DQN/dqn_cql_wt_p4/ -d test
--c dqn_cql -o cql_weight 0.3 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/DQN/dqn_cql_wt_p3/ -d test
--c dqn_cql -o cql_weight 0.2 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/DQN/dqn_cql_wt_p2/ -d test
--c dqn_cql -o cql_weight 0.1 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/DQN/dqn_cql_wt_p1/ -d test
--c dqn_cql -o cql_weight 0.05 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/DQN/dqn_cql_wt_p05/ -d test

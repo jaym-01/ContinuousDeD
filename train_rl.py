@@ -1,5 +1,6 @@
 ## IMPORTS
 import os, sys, time
+import json
 import random
 import pickle
 import click
@@ -8,7 +9,7 @@ import numpy as np
 
 import torch
 
-from rl_utils import RLDataLoader, DQN_Agent, IQN_Agent
+from rl_utils import RLDataLoader, DQN_Agent, IQN_Agent, ContinuousIQN_OfflineAgent
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(ROOT_DIR)
@@ -24,13 +25,32 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def train_network(params, device, train_loader, val_loader):
     """Using the `params`, define a Q-Network to be trained with `train_loader` and periodically validated using `val_loader`."""
 
+    # Smoke-test mode: trim data to 500 transitions and cap at 2 epochs
+    if params.get('smoke_test', False):
+        print(">>> SMOKE TEST MODE: capping at 500 transitions and 2 epochs <<<")
+        for key in train_loader.transition_data:
+            train_loader.transition_data[key] = dict(
+                list(train_loader.transition_data[key].items())[:500]
+            )
+        train_loader.transition_data_size = 500
+        train_loader.transition_indices = np.arange(500)
+        train_loader.transition_indices_pos_last = [
+            i for i in train_loader.transition_indices_pos_last if i < 500
+        ]
+        train_loader.transition_indices_neg_last = [
+            i for i in train_loader.transition_indices_neg_last if i < 500
+        ]
+        params['num_epochs'] = 2
+
     # Initialize the model
     if params['model'] == 'DQN':
         model = DQN_Agent(params['input_dim'], params, sided_Q=params['sided_Q'], device=device)
     elif params['model'] == 'IQN':
         model = IQN_Agent(params['input_dim'], params, sided_Q=params['sided_Q'], device=device)
+    elif params['model'] == 'ContinuousIQN':
+        model = ContinuousIQN_OfflineAgent(params['input_dim'], params, sided_Q=params['sided_Q'], device=device)
     else:
-        raise NotImplementedError('The provided model type has not yet been defined, please use DQN or IQN')
+        raise NotImplementedError('The provided model type has not yet been defined, please use DQN, IQN, or ContinuousIQN')
 
     # Set-up train/val artifacts
     curr_epoch = 0
@@ -155,15 +175,52 @@ def run(config, options):
 
     # Initialize the data-loaders from the NCDE encoded data
     train_loader = RLDataLoader(
-                    params['data_dir'], rng, params['train_batch_size'], 
-                    dataset=dataset, pos_samples_in_minibatch=params['num_ps'], 
+                    params['data_dir'], rng, params['train_batch_size'],
+                    dataset=dataset, pos_samples_in_minibatch=params['num_ps'],
                     neg_samples_in_minibatch=params['num_ns'], device=device)
-    train_loader.make_transition_data(release=True)
+    # Build transitions without releasing — state stats needed for continuous agent
+    train_loader.make_transition_data(release=False)
+
+    meta_path = os.path.join(params['data_dir'], "encoded_meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        ncde_hidden_dim = meta.get("ncde_hidden_dim", None)
+        if ncde_hidden_dim is not None and int(ncde_hidden_dim) != int(train_loader.data_dim):
+            raise ValueError(
+                "Encoded data dimension does not match NCDE metadata. "
+                f"encoded state_dim={train_loader.data_dim}, ncde_hidden_dim={ncde_hidden_dim}. "
+                "Re-run encode_data.py with the intended NCDE model or point RL to the correct data_dir."
+            )
+        if train_loader.continuous_actions:
+            enc_action_dim = int(train_loader.encoded_actions.shape[-1])
+            cfg_action_dim = int(params.get("action_dim", enc_action_dim))
+            if enc_action_dim != cfg_action_dim:
+                raise ValueError(
+                    "Encoded action_dim does not match RL config. "
+                    f"encoded action_dim={enc_action_dim}, config action_dim={cfg_action_dim}. "
+                    "Update iqn config or regenerate encoded data."
+                )
+    else:
+        print(
+            "Warning: encoded_meta.json not found; cannot verify NCDE/RL dimensional consistency. "
+            "Re-run encode_data.py to generate metadata."
+        )
 
     params['input_dim'] = train_loader.data_dim
 
+    # For the continuous IQN, compute per-dim state mean/std for normalisation
+    if params.get('model') == 'ContinuousIQN':
+        print("Computing state normalisation statistics from training data...")
+        state_mean, state_std = train_loader.compute_state_stats()
+        params['state_mean'] = state_mean
+        params['state_std']  = state_std
+
+    # Now release the raw encoded arrays to free memory
+    train_loader.release()
+
     val_loader = RLDataLoader(
-                    params['data_dir'], rng, params['val_batch_size'], 
+                    params['data_dir'], rng, params['val_batch_size'],
                     dataset='validation', device=device)
     val_loader.make_transition_data(release=True)
 

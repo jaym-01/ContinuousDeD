@@ -148,7 +148,7 @@ def get_dn_rn_info(qnet_dn, qnet_rn, encoded_data, device, distributional=False,
     print("Q values made.")
     return data
 
-
+#Fixed version for use with continuous IQN
 def pre_flag_splitting(value_data, VaR_thresholds, distributional=False):
     if distributional:
         num_VaR_thres = len(VaR_thresholds)
@@ -193,9 +193,10 @@ def pre_flag_splitting(value_data, VaR_thresholds, distributional=False):
                     cvar_dn_traj[:, i, :] = np.mean(dn_q_traj[-1][:, :var_cutoff, :], axis=1)
                     cvar_rn_traj[:, i, :] = np.mean(rn_q_traj[-1][:, :var_cutoff, :], axis=1)
 
-                # Select the CVaR values for only the actions that were actually used
-                dn_q_selected_action = torch.from_numpy(cvar_dn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, num_VaR_thres, 1)).squeeze().numpy()
-                rn_q_selected_action = torch.from_numpy(cvar_rn_traj).gather(2, torch.from_numpy(d.a.values).unsqueeze(-1).unsqueeze(-1).expand(num_steps, num_VaR_thres, 1)).squeeze().numpy()
+                # In continuous spaces, the network already evaluated the specific action.
+                # cvar_traj has shape (num_steps, num_VaR_thres, 1). We just grab index 0 of the last dimension.
+                dn_q_selected_action = cvar_dn_traj[..., 0]
+                rn_q_selected_action = cvar_rn_traj[..., 0]
 
                 # Record the CVaR values for all VaR thresholds (for computing the median across actions)
                 dn_q_CVaR_traj.append(cvar_dn_traj)
@@ -216,7 +217,6 @@ def pre_flag_splitting(value_data, VaR_thresholds, distributional=False):
             results[traj_type]["rn_v_median_traj"] = [np.median(q, axis=2) for q in rn_q_CVaR_traj]
     
     return results
-
 
 def create_analysis_df(results, num_survivors, num_nonsurvivors):
     """
