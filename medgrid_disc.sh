@@ -11,10 +11,10 @@
 module load Python/3.12.3-GCCcore-13.3.0
 
 # Change to the directory where the job was submitted from
-cd /rds/general/user/kd925/home/ContinuousDeD
+cd /home/ContinuousDeD
 
 # Activate your virtual environment
-source /rds/general/user/kd925/home/rl_venv/bin/activate
+source /home/rl_venv/bin/activate
 
 # Execute your python script
 python test_disc15.py
