@@ -1,6 +1,10 @@
-# Uncertainty-Aware Medical Dead Ends
-Incorporating uncertainties into Medical Dead Ends, looking to develop a more tangible estimate of the risk associated with treatments
+# Dead-End Discovery in Continuous-Action Offline Reinforcement Learning
 
-Taylor Killian, Sonali Parbhoo, Marzyeh Ghassemi
+- To reproduce the sepsis experiment results, run
 
-Link to overleaf: https://www.overleaf.com/7299737644jvmhjcbsddwh
+```
+./sepsis_train_continuous.sh
+./sepsis_train_discrete.sh
+```
+
+- run all the cells in ./notebooks/roc_curves_consistent.ipynb

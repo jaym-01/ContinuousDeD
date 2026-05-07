@@ -1,5 +1,0 @@
--c iqn_cql -o cql_weight 0.4 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/IQN/iqn_cql_wt_p4/
--c iqn_cql -o cql_weight 0.3 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/IQN/iqn_cql_wt_p3/
--c iqn_cql -o cql_weight 0.2 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/IQN/iqn_cql_wt_p2/
--c iqn_cql -o cql_weight 0.1 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/IQN/iqn_cql_wt_p1/
--c iqn_cql -o cql_weight 0.05 -o checkpoint_fname /ais/bulbasaur/twkillian/UncDeD_Results/IQN/iqn_cql_wt_p05/
